@@ -7,12 +7,13 @@ import pandas as pd
 
 from market_data.config import (
     DAILY_CACHE_OVERLAP_BARS,
-    DATABASE_PATH,
     ENABLE_TUSHARE_FALLBACK,
     MIN_ETF_LIST_SIZE,
     MIN_STOCK_LIST_SIZE,
     MINUTE_CACHE_TTL_SECONDS,
     PROVIDER_MAX_RETRIES,
+    get_database_journal_mode,
+    get_database_path,
 )
 from market_data.database import MarketDataDatabase
 from market_data.exceptions import MarketDataError, ProviderUnavailableError
@@ -36,7 +37,7 @@ class MarketDataService:
         minimum_etf_count=MIN_ETF_LIST_SIZE,
         now_provider=None,
     ):
-        self.database = database or MarketDataDatabase(DATABASE_PATH)
+        self.database = database or MarketDataDatabase(get_database_path(), get_database_journal_mode())
         self.max_retries = max(1, max_retries)
         self.minimum_stock_count = max(1, minimum_stock_count)
         self.minimum_etf_count = max(1, minimum_etf_count)

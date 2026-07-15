@@ -55,8 +55,14 @@ class WebAppTest(unittest.TestCase):
         self.database.save_stock_signals(self.run_id, "000001.SZ", "平安银行", [StockStatus.SUPPORT_LEVEL_REBOUND.value])
         self.database.save_scan_error(self.run_id, "600000.SH", "浦发银行", "TimeoutError", "行情接口请求超时")
         self.database.finish_scan_run(self.run_id, "completed", 2, 1, 1)
-        app = create_app({"TESTING": True}, database=self.database, task_manager=FakeTaskManager())
-        self.client = app.test_client()
+        self.settings_path = Path(self.temp_dir.name) / "app_settings.json"
+        self.task_manager = FakeTaskManager()
+        self.app = create_app(
+            {"TESTING": True, "DATABASE_SETTINGS_PATH": self.settings_path},
+            database=self.database,
+            task_manager=self.task_manager,
+        )
+        self.client = self.app.test_client()
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -65,6 +71,7 @@ class WebAppTest(unittest.TestCase):
         response = self.client.get("/")
         page = response.get_data(as_text=True)
         stylesheet = Path("web_app/static/css/app.css").read_text(encoding="utf-8")
+        script = Path("web_app/static/js/app.js").read_text(encoding="utf-8")
 
         self.assertEqual(200, response.status_code)
         self.assertIn("themeToggle", page)
@@ -72,12 +79,17 @@ class WebAppTest(unittest.TestCase):
         self.assertNotIn("策略信号中心", page)
         self.assertNotIn("任务中心", page)
         self.assertIn('data-view-target="etfs"', page)
+        self.assertIn('data-view-target="settings"', page)
+        self.assertIn('id="databaseSettingsForm"', page)
         self.assertIn('id="stockGroupTabs"', page)
         self.assertIn('id="etfGroupTabs"', page)
         self.assertNotIn("ETF主数据", page)
         self.assertNotIn("股票主数据", page)
         self.assertEqual(2, page.count("danger-action is-placeholder"))
-        self.assertEqual(3, page.count('class="app-modal-backdrop"'))
+        self.assertEqual(4, page.count('class="app-modal-backdrop"'))
+        self.assertIn('id="confirmModal"', page)
+        self.assertIn("confirmAction", script)
+        self.assertNotIn("window.confirm", script)
         self.assertIn("vendor/tabler/tabler.min.css", page)
         self.assertIn('data-bs-theme="dark"', page)
         self.assertEqual(6, page.count('class="table table-vcenter table-hover"'))
@@ -156,6 +168,57 @@ class WebAppTest(unittest.TestCase):
 
         self.assertEqual(1, len(payload["items"]))
         self.assertEqual("market_scan", payload["items"][0]["task_type"])
+
+    def test_completed_task_record_and_related_results_can_be_deleted(self):
+        retry_run_id = self.database.start_retry_run(self.run_id, 1)
+        self.database.finish_scan_run(retry_run_id, "failed", 1, 0, 1, "重试失败")
+
+        response = self.client.delete(f"/api/task-runs/{self.run_id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIsNone(self.database.get_scan_run(self.run_id))
+        self.assertEqual([], self.database.get_scan_errors(self.run_id))
+        self.assertEqual([], self.database.get_latest_signals())
+        self.assertIsNone(self.database.get_scan_run(retry_run_id)["parent_run_id"])
+
+    def test_running_task_record_cannot_be_deleted(self):
+        running_id = self.database.start_scan_run(10)
+
+        response = self.client.delete(f"/api/task-runs/{running_id}")
+
+        self.assertEqual(409, response.status_code)
+        self.assertIn("运行中的任务不能删除", response.get_json()["error"])
+        self.assertIsNotNone(self.database.get_scan_run(running_id))
+
+    def test_database_settings_can_copy_and_switch_to_cloud_directory(self):
+        target_directory = Path(self.temp_dir.name) / "OneDrive" / "AStockData"
+
+        response = self.client.post(
+            "/api/settings/database",
+            json={"database_directory": str(target_directory), "copy_current": True, "cloud_sync_mode": True},
+        )
+        payload = response.get_json()
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(payload["copied_current_database"])
+        self.assertTrue(payload["cloud_sync_mode"])
+        self.assertEqual("DELETE", payload["journal_mode"])
+        self.assertEqual((target_directory / "market_data.db").resolve(), Path(payload["database_path"]))
+        self.assertTrue((target_directory / "market_data.db").exists())
+        self.assertTrue(self.settings_path.exists())
+        self.assertEqual(2, self.client.get("/api/dashboard").get_json()["stats"]["stock_count"])
+
+    def test_database_switch_is_blocked_while_task_is_running(self):
+        self.task_manager.tasks["scan_market"]["status"] = "running"
+
+        response = self.client.post(
+            "/api/settings/database",
+            json={"database_directory": str(Path(self.temp_dir.name) / "blocked")},
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertIn("运行中的任务", response.get_json()["error"])
+        self.assertFalse(self.settings_path.exists())
 
     def test_scan_error_detail_and_retry_endpoint(self):
         detail = self.client.get(f"/api/scan-runs/{self.run_id}/errors").get_json()

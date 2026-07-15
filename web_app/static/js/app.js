@@ -20,6 +20,8 @@ const state = {
     tasks: {},
     selectedErrorRun: null,
     errorDetail: null,
+    databaseSettings: null,
+    confirmationResolver: null,
 };
 
 const viewMeta = {
@@ -28,6 +30,7 @@ const viewMeta = {
     stocks: ["STOCK UNIVERSE", "股票列表"],
     etfs: ["ETF UNIVERSE", "ETF列表"],
     runs: ["AUTOMATION", "任务记录"],
+    settings: ["PREFERENCES", "系统设置"],
 };
 
 const toneColors = {
@@ -83,6 +86,7 @@ function showView(viewName) {
     if (viewName === "stocks") loadStocks();
     if (viewName === "etfs") loadEtfs();
     if (viewName === "runs") loadRuns();
+    if (viewName === "settings") loadDatabaseSettings();
     window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -129,10 +133,15 @@ function bindActions() {
     document.querySelectorAll("[data-assign-modal-close]").forEach((button) => {
         button.addEventListener("click", closeAssignGroupModal);
     });
+    document.querySelectorAll("[data-confirm-modal-close]").forEach((button) => {
+        button.addEventListener("click", () => resolveConfirmation(false));
+    });
+    document.getElementById("confirmModalAccept")?.addEventListener("click", () => resolveConfirmation(true));
     document.querySelectorAll("[data-create-group]").forEach((button) => {
         button.addEventListener("click", () => openGroupModal(button.dataset.createGroup));
     });
     document.getElementById("groupForm")?.addEventListener("submit", createGroup);
+    document.getElementById("databaseSettingsForm")?.addEventListener("submit", saveDatabaseSettings);
     document.getElementById("deleteStockGroup")?.addEventListener("click", () => deleteCurrentGroup("stock"));
     document.getElementById("deleteEtfGroup")?.addEventListener("click", () => deleteCurrentGroup("etf"));
     document.getElementById("retryErrorsButton")?.addEventListener("click", retrySelectedErrors);
@@ -141,7 +150,9 @@ function bindActions() {
         const assignModal = document.getElementById("assignGroupModal");
         const groupModal = document.getElementById("groupModal");
         const errorModal = document.getElementById("errorModal");
-        if (assignModal && !assignModal.hidden) closeAssignGroupModal();
+        const confirmModal = document.getElementById("confirmModal");
+        if (confirmModal && !confirmModal.hidden) resolveConfirmation(false);
+        else if (assignModal && !assignModal.hidden) closeAssignGroupModal();
         else if (groupModal && !groupModal.hidden) closeGroupModal();
         else if (errorModal && !errorModal.hidden) closeErrorModal();
     });
@@ -633,7 +644,14 @@ async function deleteCurrentGroup(assetType) {
     const groupId = assetType === "stock" ? state.stockGroupId : state.etfGroupId;
     const groups = assetType === "stock" ? state.stockGroups : state.etfGroups;
     const group = groups.find((item) => item.id === Number(groupId));
-    if (!group || !window.confirm(`删除分组“${group.name}”？分组内条目不会从主列表删除。`)) return;
+    if (!group) return;
+    const confirmed = await confirmAction({
+        title: "删除自定义分组",
+        message: `确定删除分组“${group.name}”吗？分组内条目不会从股票或ETF主列表删除。`,
+        confirmText: "删除分组",
+        tone: "danger",
+    });
+    if (!confirmed) return;
     try {
         await api(`/api/instrument-groups/${group.id}`, { method: "DELETE" });
         toast(`分组“${group.name}”已删除`);
@@ -705,7 +723,14 @@ async function toggleInstrumentPin(assetType, code, pinnedText) {
 
 async function removeInstrumentFromGroup(assetType, code) {
     const groupId = assetType === "stock" ? state.stockGroupId : state.etfGroupId;
-    if (!groupId || !window.confirm("从当前分组移除此条目？")) return;
+    if (!groupId) return;
+    const confirmed = await confirmAction({
+        title: "移出当前分组",
+        message: "确定将该条目从当前分组移出吗？条目仍会保留在主列表和其他自定义分组中。",
+        confirmText: "确认移出",
+        tone: "danger",
+    });
+    if (!confirmed) return;
     try {
         await api(`/api/instrument-groups/${groupId}/items/${encodeURIComponent(code)}`, { method: "DELETE" });
         toast("已从当前分组移除");
@@ -724,6 +749,33 @@ function syncModalOpenState() {
     document.body.classList.toggle("modal-open", hasOpenModal);
 }
 
+function confirmAction({ title, message, confirmText = "确认", tone = "primary" }) {
+    const modal = document.getElementById("confirmModal");
+    if (state.confirmationResolver) state.confirmationResolver(false);
+    document.getElementById("confirmModalTitle").textContent = title;
+    document.getElementById("confirmModalMessage").textContent = message;
+    const acceptButton = document.getElementById("confirmModalAccept");
+    acceptButton.textContent = confirmText;
+    acceptButton.classList.toggle("confirm-danger-button", tone === "danger");
+    document.getElementById("confirmModalIcon").classList.toggle("danger", tone === "danger");
+    modal.hidden = false;
+    syncModalOpenState();
+    window.setTimeout(() => acceptButton.focus(), 0);
+    return new Promise((resolve) => {
+        state.confirmationResolver = resolve;
+    });
+}
+
+function resolveConfirmation(confirmed) {
+    const modal = document.getElementById("confirmModal");
+    if (!modal || modal.hidden) return;
+    modal.hidden = true;
+    syncModalOpenState();
+    const resolver = state.confirmationResolver;
+    state.confirmationResolver = null;
+    resolver?.(confirmed);
+}
+
 async function loadRuns() {
     try {
         const data = await api("/api/task-progress?limit=20");
@@ -731,6 +783,79 @@ async function loadRuns() {
         renderRunRows(data.task_runs || data.scan_runs);
     } catch (error) {
         toast(error.message, true);
+    }
+}
+
+async function loadDatabaseSettings() {
+    const status = document.getElementById("databaseSettingsState");
+    status.className = "status-pill running";
+    status.textContent = "正在读取";
+    try {
+        const data = await api("/api/settings/database");
+        state.databaseSettings = data;
+        renderDatabaseSettings(data);
+    } catch (error) {
+        status.className = "status-pill failed";
+        status.textContent = "读取失败";
+        toast(error.message, true);
+    }
+}
+
+function renderDatabaseSettings(data) {
+    const managed = Boolean(data.managed_by_environment);
+    const directoryInput = document.getElementById("databaseDirectory");
+    const copyInput = document.getElementById("copyCurrentDatabase");
+    const cloudModeInput = document.getElementById("cloudSyncMode");
+    const saveButton = document.getElementById("saveDatabaseSettings");
+    directoryInput.value = data.database_directory || "";
+    cloudModeInput.checked = Boolean(data.cloud_sync_mode);
+    document.getElementById("databaseCurrentPath").textContent = data.database_path || "—";
+    document.getElementById("databaseSize").textContent = formatBytes(data.size_bytes);
+    document.getElementById("databaseJournalMode").textContent = data.journal_mode || "—";
+    document.getElementById("databaseSettingsState").className = "status-pill completed";
+    document.getElementById("databaseSettingsState").textContent = managed ? "环境变量托管" : "已启用";
+    [directoryInput, copyInput, cloudModeInput, saveButton].forEach((element) => {
+        element.disabled = managed;
+    });
+    document.getElementById("databaseSettingsHint").textContent = managed
+        ? "当前由 MARKET_DATA_DB 环境变量托管，需要在启动环境中修改。"
+        : "切换期间不能有正在运行的扫描、刷新或重试任务。";
+}
+
+async function saveDatabaseSettings(event) {
+    event.preventDefault();
+    const directory = document.getElementById("databaseDirectory").value.trim();
+    if (!directory) return;
+    const confirmed = await confirmAction({
+        title: "切换行情数据库",
+        message: "切换后服务会立即使用新目录。使用OneDrive时，请等待文件同步完成后再在其他设备启动项目。",
+        confirmText: "保存并切换",
+        tone: "primary",
+    });
+    if (!confirmed) return;
+    const button = document.getElementById("saveDatabaseSettings");
+    button.disabled = true;
+    button.textContent = "正在切换…";
+    try {
+        const data = await api("/api/settings/database", {
+            method: "POST",
+            body: JSON.stringify({
+                database_directory: directory,
+                copy_current: document.getElementById("copyCurrentDatabase").checked,
+                cloud_sync_mode: document.getElementById("cloudSyncMode").checked,
+            }),
+        });
+        state.databaseSettings = data;
+        renderDatabaseSettings(data);
+        if (data.copied_current_database) toast("当前数据库已安全复制，并切换到新目录");
+        else if (data.used_existing_database) toast("已切换到目标目录中已有的数据库");
+        else toast("数据库设置已保存");
+        await loadDashboard();
+    } catch (error) {
+        toast(error.message, true);
+    } finally {
+        button.disabled = Boolean(state.databaseSettings?.managed_by_environment);
+        button.textContent = "保存并切换";
     }
 }
 
@@ -744,7 +869,9 @@ function renderRunRows(items) {
         const errorLabel = item.error_count > 0 ? `${item.error_count} 条` : "查看原因";
         const isRetry = item.task_type === "error_retry";
         const taskLabel = isRetry ? "错误股票重试" : "全市场扫描";
-        const taskSource = isRetry && item.parent_run_id ? `来源扫描任务 #${item.parent_run_id}` : "全市场股票";
+        const taskSource = isRetry
+            ? item.parent_run_id ? `来源扫描任务 #${item.parent_run_id}` : "原扫描任务已删除"
+            : "全市场股票";
         const detailRunId = isRetry ? item.parent_run_id : item.id;
         const resultLabel = isRetry ? `${item.matched_stocks} 条已解决` : `${item.matched_stocks} 只命中`;
         let errorCell = `<span class="quiet-label">0</span>`;
@@ -759,11 +886,37 @@ function renderRunRows(items) {
             <td><div class="table-progress"><div class="progress-copy"><strong>${item.processed_stocks}/${item.total_stocks}</strong>
             <span>${progress}%</span></div><div class="mini-progress ${isRunning ? "running" : ""}">
             <span style="width:${progress}%"></span></div></div></td><td><strong>${resultLabel}</strong></td>
-            <td>${errorCell}</td><td>${formatDate(item.started_at)}</td></tr>`;
-    }).join("") : '<tr><td colspan="6" class="table-empty">暂无任务记录</td></tr>';
+            <td>${errorCell}</td><td>${formatDate(item.started_at)}</td><td>
+            ${isRunning ? '<span class="quiet-label">执行中</span>' : `<button class="row-action danger-action"
+            data-delete-run="${item.id}" type="button">删除</button>`}</td></tr>`;
+    }).join("") : '<tr><td colspan="7" class="table-empty">暂无任务记录</td></tr>';
     rows.querySelectorAll("[data-error-run]").forEach((button) => {
         button.addEventListener("click", () => openErrorModal(Number(button.dataset.errorRun)));
     });
+    rows.querySelectorAll("[data-delete-run]").forEach((button) => {
+        button.addEventListener("click", () => deleteTaskRun(Number(button.dataset.deleteRun), button));
+    });
+}
+
+async function deleteTaskRun(runId, button) {
+    const confirmed = await confirmAction({
+        title: `删除任务 #${runId}`,
+        message: "该任务关联的策略结果和错误明细也会一并删除，此操作无法撤销。",
+        confirmText: "确认删除",
+        tone: "danger",
+    });
+    if (!confirmed) return;
+    button.disabled = true;
+    button.textContent = "删除中…";
+    try {
+        await api(`/api/task-runs/${runId}`, { method: "DELETE" });
+        toast(`任务 #${runId} 已删除`);
+        await Promise.all([loadRuns(), loadDashboard()]);
+    } catch (error) {
+        toast(error.message, true);
+        button.disabled = false;
+        button.textContent = "删除";
+    }
 }
 
 function renderTasks(tasks, latestScan) {
@@ -923,7 +1076,15 @@ async function retrySelectedErrors() {
 }
 
 async function startTask(taskName) {
-    if (taskName === "scan" && !window.confirm("全市场扫描耗时较长，确定现在启动吗？")) return;
+    if (taskName === "scan") {
+        const confirmed = await confirmAction({
+            title: "启动全市场扫描",
+            message: "扫描会遍历全部股票并按需补充历史行情，执行时间取决于本地缓存和数据源状态。",
+            confirmText: "开始扫描",
+            tone: "primary",
+        });
+        if (!confirmed) return;
+    }
     const paths = {
         scan: "/api/tasks/scan-market",
         "refresh-stocks": "/api/tasks/refresh-stocks",
@@ -989,6 +1150,19 @@ function errorStatusLabel(status) {
 
 function formatNumber(value) {
     return new Intl.NumberFormat("zh-CN").format(Number(value) || 0);
+}
+
+function formatBytes(value) {
+    const bytes = Number(value) || 0;
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let amount = bytes;
+    let unitIndex = -1;
+    do {
+        amount /= 1024;
+        unitIndex += 1;
+    } while (amount >= 1024 && unitIndex < units.length - 1);
+    return `${amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 function formatPercent(value) {

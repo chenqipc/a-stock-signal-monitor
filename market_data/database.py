@@ -1,7 +1,7 @@
 """基于 SQLite 的历史K线、交易日历和通知状态存储。"""
 
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,8 +21,11 @@ TASK_TYPE_ERROR_RETRY = "error_retry"
 class MarketDataDatabase:
     """提供小规模股票监控所需的 SQLite 持久化能力。"""
 
-    def __init__(self, database_path):
+    def __init__(self, database_path, journal_mode="WAL"):
         self.database_path = Path(database_path)
+        self.journal_mode = str(journal_mode).upper()
+        if self.journal_mode not in {"WAL", "DELETE"}:
+            raise ValueError(f"不支持的SQLite日志模式: {journal_mode}")
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -30,8 +33,9 @@ class MarketDataDatabase:
     def _connect(self):
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
+        # 云盘兼容模式使用DELETE，避免持久化的WAL/SHM文件参与同步。
+        connection.execute(f"PRAGMA journal_mode={self.journal_mode}")
         connection.execute("PRAGMA foreign_keys=ON")
         try:
             yield connection
@@ -168,6 +172,39 @@ class MarketDataDatabase:
             self._ensure_column(connection, "scan_run", "task_type", "TEXT NOT NULL DEFAULT 'market_scan'")
             self._ensure_column(connection, "scan_run", "parent_run_id", "INTEGER")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_run_task_type ON scan_run(task_type, id DESC)")
+
+    def backup_to(self, target_path):
+        """使用SQLite在线备份API生成一致快照，包含尚未checkpoint的WAL数据。"""
+        target_path = Path(target_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.resolve() == self.database_path.resolve():
+            return target_path
+        if target_path.exists():
+            raise FileExistsError(f"目标数据库已存在，不允许覆盖: {target_path}")
+        temporary_path = target_path.with_suffix(f"{target_path.suffix}.copying")
+        temporary_path.unlink(missing_ok=True)
+        try:
+            # 先备份到临时文件，完整性校验通过后再原子替换，避免云盘同步到半份数据库。
+            with closing(sqlite3.connect(self.database_path, timeout=30)) as source:
+                with closing(sqlite3.connect(temporary_path, timeout=30)) as target:
+                    source.backup(target)
+                    # 备份会复制源库的WAL标记，落盘前改回单文件日志模式并完成checkpoint。
+                    target.execute("PRAGMA journal_mode=DELETE")
+                    integrity_result = target.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity_result != "ok":
+                raise sqlite3.DatabaseError(f"数据库备份完整性检查失败: {integrity_result}")
+            self._remove_sqlite_sidecars(temporary_path)
+            temporary_path.replace(target_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            self._remove_sqlite_sidecars(temporary_path)
+            raise
+        return target_path
+
+    @staticmethod
+    def _remove_sqlite_sidecars(database_path):
+        for suffix in ("-wal", "-shm"):
+            Path(f"{database_path}{suffix}").unlink(missing_ok=True)
 
     @staticmethod
     def _ensure_column(connection, table, column, definition):
@@ -640,6 +677,21 @@ class MarketDataDatabase:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM scan_run WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
+
+    def delete_task_run(self, run_id):
+        """删除已结束任务及其结果；运行中任务必须先正常结束。"""
+        with self._connect() as connection:
+            row = connection.execute("SELECT status FROM scan_run WHERE id = ?", (int(run_id),)).fetchone()
+            if not row:
+                return "not_found"
+            if row["status"] == "running":
+                return "running"
+            # 重试任务可以独立保留，但原扫描删除后不应继续引用不存在的来源任务。
+            connection.execute("UPDATE scan_run SET parent_run_id = NULL WHERE parent_run_id = ?", (int(run_id),))
+            connection.execute("DELETE FROM stock_signal WHERE run_id = ?", (int(run_id),))
+            connection.execute("DELETE FROM scan_error WHERE run_id = ?", (int(run_id),))
+            connection.execute("DELETE FROM scan_run WHERE id = ?", (int(run_id),))
+        return "deleted"
 
     def get_scan_errors(self, run_id, unresolved_only=False, limit=500):
         condition = "AND status = 'failed'" if unresolved_only else ""

@@ -1,13 +1,21 @@
 """Flask Web入口和JSON接口。"""
 
+import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from flask import Flask, jsonify, render_template, request
 
 from common.StockEnum import StockStatus
 from etf_monitor.watchlist import DEFAULT_WATCHLIST
-from market_data.config import DATABASE_PATH
+from market_data.config import (
+    DATABASE_FILENAME,
+    get_database_configuration,
+    get_database_journal_mode,
+    get_database_path,
+    save_database_configuration,
+)
 from market_data.database import MarketDataDatabase
 from market_data.service import MarketDataService
 from market_data.trading_calendar import TRADING_SESSIONS
@@ -23,12 +31,16 @@ def create_app(config=None, database=None, task_manager=None):
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.json.ensure_ascii = False
     app.config.update(config or {})
-    market_database = database or MarketDataDatabase(DATABASE_PATH)
+    settings_path = app.config.get("DATABASE_SETTINGS_PATH")
+    market_database = database or MarketDataDatabase(
+        get_database_path(settings_path), get_database_journal_mode(settings_path)
+    )
     # 后台任务依附于Web进程，启动时先收尾上次进程遗留的运行中记录。
     if app.config.get("RECOVER_INTERRUPTED_TASKS", True):
         market_database.fail_interrupted_scan_runs()
     app.extensions["market_database"] = market_database
     app.extensions["task_manager"] = task_manager or TaskManager()
+    app.extensions["database_settings_path"] = settings_path
 
     @app.get("/")
     def index():
@@ -155,6 +167,15 @@ def create_app(config=None, database=None, task_manager=None):
         limit = _positive_int(request.args.get("limit"), 10)
         return jsonify({"items": _database(app).get_task_history(limit)})
 
+    @app.delete("/api/task-runs/<int:run_id>")
+    def delete_task_run(run_id):
+        result = _database(app).delete_task_run(run_id)
+        if result == "not_found":
+            return jsonify({"error": "任务记录不存在"}), 404
+        if result == "running":
+            return jsonify({"error": "运行中的任务不能删除，请等待任务结束"}), 409
+        return jsonify({"deleted": True, "run_id": run_id})
+
     @app.get("/api/scan-runs/<int:run_id>/errors")
     def scan_run_errors(run_id):
         database = _database(app)
@@ -198,6 +219,52 @@ def create_app(config=None, database=None, task_manager=None):
     @app.get("/api/tasks")
     def tasks():
         return jsonify(_task_manager(app).get_status())
+
+    @app.get("/api/settings/database")
+    def database_settings():
+        return jsonify(_database_settings_payload(app))
+
+    @app.post("/api/settings/database")
+    def update_database_settings():
+        """安全切换数据库目录；目标不存在时可复制当前数据库快照。"""
+        body = request.get_json(silent=True) or {}
+        configuration = get_database_configuration(app.extensions["database_settings_path"])
+        if configuration["managed_by_environment"]:
+            return jsonify({"error": "数据库路径由 MARKET_DATA_DB 环境变量管理，无法在网页中修改"}), 409
+        running_tasks = [
+            name for name, state in _task_manager(app).get_status().items() if state.get("status") == "running"
+        ]
+        if running_tasks:
+            return jsonify({"error": f"请等待运行中的任务结束后再切换数据库: {', '.join(running_tasks)}"}), 409
+        directory = Path(str(body.get("database_directory") or "").strip()).expanduser()
+        if not directory.is_absolute():
+            return jsonify({"error": "数据库目录必须是绝对路径"}), 400
+        directory = directory.resolve()
+        copy_current = body.get("copy_current", True)
+        cloud_sync_mode = body.get("cloud_sync_mode", False)
+        if not isinstance(copy_current, bool) or not isinstance(cloud_sync_mode, bool):
+            return jsonify({"error": "copy_current 和 cloud_sync_mode 必须是布尔值"}), 400
+        target_path = directory / DATABASE_FILENAME
+        current_database = _database(app)
+        same_database = target_path == current_database.database_path.resolve()
+        target_existed = target_path.exists()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            copied = False
+            if not same_database and not target_existed and copy_current:
+                current_database.backup_to(target_path)
+                copied = True
+            journal_mode = "DELETE" if cloud_sync_mode else "WAL"
+            new_database = MarketDataDatabase(target_path, journal_mode)
+            save_database_configuration(
+                directory, cloud_sync_mode, settings_path=app.extensions["database_settings_path"]
+            )
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+            return jsonify({"error": f"数据库目录切换失败: {exc}"}), 400
+        app.extensions["market_database"] = new_database
+        payload = _database_settings_payload(app)
+        payload.update({"copied_current_database": copied, "used_existing_database": target_existed})
+        return jsonify(payload)
 
     @app.get("/api/task-progress")
     def task_progress():
@@ -246,6 +313,22 @@ def _database(app):
 
 def _task_manager(app):
     return app.extensions["task_manager"]
+
+
+def _database_settings_payload(app):
+    database = _database(app)
+    configuration = get_database_configuration(app.extensions["database_settings_path"])
+    database_path = database.database_path.resolve()
+    return {
+        "database_directory": str(database_path.parent),
+        "database_path": str(database_path),
+        "database_filename": DATABASE_FILENAME,
+        "exists": database_path.exists(),
+        "size_bytes": database_path.stat().st_size if database_path.exists() else 0,
+        "cloud_sync_mode": database.journal_mode == "DELETE",
+        "journal_mode": database.journal_mode,
+        "managed_by_environment": configuration["managed_by_environment"],
+    }
 
 
 def _indicator_catalog(summary):
