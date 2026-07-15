@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-stock-signal-monitor"
+version = "0.3.0"
+description = "A股全市场策略筛选、ETF分钟均线监控与多数据源行情缓存工具"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "baostock>=0.9.3,<1.0",
+    "Flask>=3.1,<4.0",
+    "pandas>=2.2,<3.0",
+    "requests>=2.32,<3.0",
+    "schedule>=1.2,<2.0",
+]
+
+[project.optional-dependencies]
+tushare = ["tushare>=1.4,<2.0"]
+
+[project.scripts]
+a-stock-refresh = "stock_signal_monitor.refresh_stock_list:refresh_stock_list"
+a-stock-refresh-etfs = "stock_signal_monitor.refresh_etf_list:main"
+a-stock-scan = "stock_signal_monitor.scan_market:scan_market"
+a-stock-monitor = "etf_monitor.etf_monitor_scheduler:main"
+a-stock-web = "web_app.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["common*", "etf_monitor*", "market_data*", "stock_signal_monitor*", "web_app*"]
+
+[tool.setuptools.package-data]
+web_app = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/vendor/tabler/*"]
+
+[tool.uv]
+package = true

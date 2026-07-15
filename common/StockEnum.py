@@ -8,7 +8,7 @@ class StockStatus(Enum):
     RISING_VOLUME_INCREASE = "连续上涨且成交量放大"
     VOLUME_SURGE_WITH_PRICE_RISE = "最近3天大幅放量伴随股价上涨"
     CAPITAL_INFLOW = "资金流入明显"
-    FUNDS_INFLOW_BY_VOLUME_TURNOVER = "成交量换收率放大"
+    FUNDS_INFLOW_BY_VOLUME_TURNOVER = "成交量换手率放大"
     SUPPORT_LEVEL_REBOUND = "底部支撑反弹10日线"
     SUPPORT_LEVEL_REBOUND_60 = "底部支撑反弹60日均线"
     MACD_GOLDEN_CROSS = "最近3天MACD金叉"

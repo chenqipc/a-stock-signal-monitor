@@ -20,7 +20,8 @@ class NotificationManager:
             message: 弹窗内容
             auto_close_seconds: 自动关闭时间(秒)，默认2分钟
         """
-        # 创建一个新线程来显示通知，避免阻塞主线程
+        # 及时移除已经结束的线程，避免长期运行时列表无限增长。
+        self.active_notifications = [thread for thread in self.active_notifications if thread.is_alive()]
         notification_thread = threading.Thread(
             target=self._show_notification_window,
             args=(title, message, auto_close_seconds)
@@ -36,15 +37,21 @@ class NotificationManager:
         内部方法：显示通知窗口并在指定时间后自动关闭
         使用macOS的原生对话框
         """
-        # 使用AppleScript显示对话框，设置自动关闭时间
+        # AppleScript 字符串必须转义，避免证券名称中的引号破坏脚本。
+        safe_title = self._escape_applescript(title)
+        safe_message = self._escape_applescript(message)
         applescript = f'''
-        display dialog "{message}" with title "{title}" buttons {{"确定"}} default button "确定" giving up after {auto_close_seconds}
+        display dialog "{safe_message}" with title "{safe_title}" buttons {{"确定"}} default button "确定" giving up after {auto_close_seconds}
         '''
         
         try:
-            subprocess.run(["osascript", "-e", applescript])
+            subprocess.run(["osascript", "-e", applescript], timeout=auto_close_seconds + 5, check=False)
         except Exception as e:
             print(f"显示通知失败: {e}")
+
+    @staticmethod
+    def _escape_applescript(value):
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 # 使用示例
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ class LoggerManager:
     @classmethod
     def setup_log_dir(cls):
         """设置日志目录"""
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        # 统一写入项目根目录，避免重构前后出现两套日志目录。
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
         os.makedirs(log_dir, exist_ok=True)
         return log_dir
     
@@ -29,7 +30,7 @@ class LoggerManager:
             return cls._loggers[logger_name]
         
         # 创建新的日志记录器
-        logger = logging.getLogger(f"etf_monitor_{logger_name}")
+        logger = logging.getLogger(f"a_stock_signal_monitor_{logger_name}")
         logger.setLevel(logging.INFO)
         
         # 防止日志重复输出
@@ -58,6 +59,7 @@ class LoggerManager:
             console_handler = logging.StreamHandler()
             console_handler.setFormatter(formatter)
             logger.addHandler(console_handler)
+            logger.propagate = False
         
         # 缓存日志记录器
         cls._loggers[logger_name] = logger

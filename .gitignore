@@ -169,6 +169,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# 本地行情缓存及SQLite运行时文件
+*.db
+*.db-shm
+*.db-wal
 双底结构.txt
 底部支撑反弹10日线.txt
 最近3天MACD金叉.txt
@@ -183,4 +188,5 @@ cython_debug/
 处于上涨初期.txt
 底部支撑反弹60日均线.txt
 成交量换收率放大.txt
+成交量换手率放大.txt
 双底结构(新).txt

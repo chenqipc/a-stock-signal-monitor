@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-bs-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A股全市场策略筛选与ETF分钟信号监控控制台">
+    <title>A-Stock Signal Monitor</title>
+    <script>
+        const savedTheme = localStorage.getItem("asm-theme");
+        const initialTheme = savedTheme || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.dataset.theme = initialTheme;
+        document.documentElement.dataset.bsTheme = initialTheme;
+    </script>
+    <!-- Tabler 提供统一的后台组件基线，项目样式只负责品牌色和业务组件扩展。 -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/tabler/tabler.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar" aria-label="主导航">
+            <a class="brand" href="#overview" aria-label="A-Stock Signal Monitor 首页">
+                <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span class="brand-copy"><strong>A-Stock</strong><small>Signal Monitor</small></span>
+            </a>
+
+            <nav class="nav-list">
+                <button class="nav-item active" data-view-target="overview" type="button">
+                    <span class="nav-icon">⌂</span><span>监控总览</span>
+                </button>
+                <button class="nav-item" data-view-target="signals" type="button">
+                    <span class="nav-icon">◇</span><span>策略信号</span>
+                </button>
+                <button class="nav-item" data-view-target="stocks" type="button">
+                    <span class="nav-icon">⌕</span><span>股票列表</span>
+                </button>
+                <button class="nav-item" data-view-target="etfs" type="button">
+                    <span class="nav-icon">▦</span><span>ETF列表</span>
+                </button>
+                <button class="nav-item" data-view-target="runs" type="button">
+                    <span class="nav-icon">↻</span><span>任务记录</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-foot">
+                <div class="system-chip"><i></i><span>SQLite 本地数据</span></div>
+                <p>多数据源自动降级</p>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <div>
+                    <p class="eyebrow" id="pageEyebrow">MARKET INTELLIGENCE</p>
+                    <h1 id="pageTitle">监控总览</h1>
+                </div>
+                <div class="topbar-actions">
+                    <span class="sync-copy" id="syncCopy">正在读取本地数据…</span>
+                    <button class="btn icon-button" id="reloadButton" type="button" aria-label="刷新页面数据" title="刷新数据">↻</button>
+                    <button class="btn theme-toggle" id="themeToggle" type="button" aria-label="切换深浅色模式">
+                        <span class="theme-icon" aria-hidden="true">☾</span><span class="theme-label">深色</span>
+                    </button>
+                </div>
+            </header>
+
+            <section class="view active" id="view-overview" data-view="overview">
+                <article class="hero-card">
+                    <div class="hero-glow"></div>
+                    <div class="hero-copy">
+                        <div class="market-badge"><i id="marketDot"></i><span id="marketLabel">读取交易状态</span></div>
+                        <p class="hero-kicker">A股策略雷达</p>
+                        <h2>把分散的指标，变成<br><span>清晰可执行的股票线索。</span></h2>
+                        <p class="hero-description">统一扫描全市场策略信号，追踪ETF均线状态，并自动记录每次筛选结果。</p>
+                        <div class="hero-actions">
+                            <button class="btn primary-button" id="startScanButton" type="button">开始全市场扫描 <span>→</span></button>
+                            <button class="btn secondary-button" id="refreshStocksButton" type="button">刷新股票列表</button>
+                        </div>
+                    </div>
+                    <div class="radar-panel" aria-hidden="true">
+                        <div class="radar-ring ring-one"></div>
+                        <div class="radar-ring ring-two"></div>
+                        <div class="radar-ring ring-three"></div>
+                        <div class="radar-sweep"></div>
+                        <div class="radar-point point-one"></div>
+                        <div class="radar-point point-two"></div>
+                        <div class="radar-point point-three"></div>
+                        <div class="radar-core"><strong id="heroSignalCount">0</strong><span>策略命中</span></div>
+                    </div>
+                </article>
+
+                <div class="metric-grid" id="metricGrid">
+                    <article class="card metric-card loading-card"></article>
+                    <article class="card metric-card loading-card"></article>
+                    <article class="card metric-card loading-card"></article>
+                    <article class="card metric-card loading-card"></article>
+                </div>
+
+                <div class="dashboard-grid">
+                    <article class="card panel signal-panel">
+                        <div class="panel-head">
+                            <div><p class="panel-kicker">SIGNAL MATRIX</p><h3>策略指标分布</h3></div>
+                            <button class="btn text-button" data-view-link="signals" type="button">查看全部 →</button>
+                        </div>
+                        <p class="panel-description">指标由策略枚举动态生成，新增策略无需修改页面结构。</p>
+                        <div class="indicator-grid" id="indicatorGrid"><div class="empty-state">正在加载指标…</div></div>
+                    </article>
+
+                    <article class="card panel watch-panel">
+                        <div class="panel-head">
+                            <div><p class="panel-kicker">ETF WATCHLIST</p><h3>ETF监控池</h3></div>
+                            <span class="live-pill">分钟线</span>
+                        </div>
+                        <div class="watch-layout">
+                            <div class="watchlist" id="watchlist"><div class="empty-state">正在加载ETF…</div></div>
+                            <div class="chart-box">
+                                <div class="chart-caption"><strong id="chartTitle">选择ETF查看走势</strong><span id="chartMeta">本地缓存K线</span></div>
+                                <canvas id="priceChart" width="720" height="260" aria-label="ETF价格走势图"></canvas>
+                            </div>
+                        </div>
+                    </article>
+
+                    <article class="card panel latest-panel">
+                        <div class="panel-head">
+                            <div><p class="panel-kicker">LATEST MATCHES</p><h3>最新命中股票</h3></div>
+                            <button class="btn text-button" data-view-link="signals" type="button">筛选信号 →</button>
+                        </div>
+                        <div class="table-wrap">
+                            <table class="table table-vcenter table-hover">
+                                <thead><tr><th>股票</th><th>策略指标</th><th>扫描任务</th></tr></thead>
+                                <tbody id="latestSignalRows"><tr><td colspan="3" class="table-empty">等待扫描结果</td></tr></tbody>
+                            </table>
+                        </div>
+                    </article>
+
+                    <article class="card panel status-panel">
+                        <div class="panel-head">
+                            <div><p class="panel-kicker">DATA PIPELINE</p><h3>数据源状态</h3></div>
+                            <span class="quiet-label">自动降级</span>
+                        </div>
+                        <div class="source-list" id="sourceList"><div class="empty-state">正在检查数据源…</div></div>
+                    </article>
+                </div>
+            </section>
+
+            <section class="view" id="view-signals" data-view="signals">
+                <article class="panel filters-panel">
+                    <label class="search-field"><span>⌕</span><input class="form-control" id="signalSearch" type="search" placeholder="搜索股票代码或名称"></label>
+                    <div class="filter-chips" id="indicatorFilters"></div>
+                    <button class="btn primary-button compact" data-action="scan" type="button">重新扫描</button>
+                </article>
+                <article class="card panel">
+                    <div class="panel-head">
+                        <div><p class="panel-kicker">MATCHED STOCKS</p><h3 id="signalTableTitle">全部指标</h3></div>
+                        <span id="signalResultCount">0 条</span>
+                    </div>
+                    <div class="table-wrap large-table">
+                        <table class="table table-vcenter table-hover"><thead><tr><th>股票代码</th><th>股票名称</th><th>命中指标</th><th>记录时间</th></tr></thead>
+                        <tbody id="signalRows"><tr><td colspan="4" class="table-empty">暂无信号数据</td></tr></tbody></table>
+                    </div>
+                </article>
+            </section>
+
+            <section class="view" id="view-stocks" data-view="stocks">
+                <div class="group-toolbar">
+                    <div class="group-tabs" id="stockGroupTabs" role="tablist" aria-label="股票分组"></div>
+                    <div class="inline-actions">
+                        <button class="btn secondary-button compact" data-action="refresh-stocks" type="button">更新股票库</button>
+                        <button class="btn text-button danger-action is-placeholder" id="deleteStockGroup" type="button"
+                                aria-hidden="true" disabled>删除当前分组</button>
+                        <button class="btn secondary-button compact" data-create-group="stock" type="button">＋ 新建股票分组</button>
+                    </div>
+                </div>
+                <article class="panel filters-panel stock-filters">
+                    <label class="search-field"><span>⌕</span><input class="form-control" id="stockSearch" type="search" placeholder="输入代码或股票名称"></label>
+                    <label class="select-field">
+                        <span>市场</span>
+                        <select class="form-select" id="marketFilter"><option value="">全部市场</option><option>上海</option><option>深圳</option><option>北京</option></select>
+                    </label>
+                </article>
+                <article class="card panel">
+                    <div class="panel-head">
+                        <div><p class="panel-kicker">STOCK MASTER</p><h3 id="stockTableTitle">全部股票</h3></div>
+                        <span id="stockResultCount">0 只</span>
+                    </div>
+                    <div class="table-wrap large-table">
+                        <table class="table table-vcenter table-hover">
+                            <thead><tr><th>证券代码</th><th>名称</th><th>市场</th><th>上市日期</th><th>数据源</th><th>操作</th></tr></thead>
+                            <tbody id="stockRows"><tr><td colspan="6" class="table-empty">正在加载股票列表…</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="pagination">
+                        <button id="stockPrev" type="button">← 上一页</button><span id="stockPageLabel">第 1 页</span>
+                        <button id="stockNext" type="button">下一页 →</button>
+                    </div>
+                </article>
+            </section>
+
+            <section class="view" id="view-etfs" data-view="etfs">
+                <div class="group-toolbar">
+                    <div class="group-tabs" id="etfGroupTabs" role="tablist" aria-label="ETF分组"></div>
+                    <div class="inline-actions">
+                        <button class="btn secondary-button compact" data-action="refresh-etfs" type="button">更新ETF库</button>
+                        <button class="btn text-button danger-action is-placeholder" id="deleteEtfGroup" type="button"
+                                aria-hidden="true" disabled>删除当前分组</button>
+                        <button class="btn secondary-button compact" data-create-group="etf" type="button">＋ 新建ETF分组</button>
+                    </div>
+                </div>
+                <article class="panel filters-panel stock-filters">
+                    <label class="search-field">
+                        <span>⌕</span><input class="form-control" id="etfSearch" type="search" placeholder="输入ETF代码或名称">
+                    </label>
+                    <label class="select-field">
+                        <span>市场</span>
+                        <select class="form-select" id="etfMarketFilter">
+                            <option value="">全部市场</option><option>上海</option><option>深圳</option>
+                        </select>
+                    </label>
+                </article>
+                <article class="card panel">
+                    <div class="panel-head">
+                        <div><p class="panel-kicker">ETF MASTER</p><h3 id="etfTableTitle">全部ETF</h3></div>
+                        <span id="etfResultCount">0 只</span>
+                    </div>
+                    <div class="table-wrap large-table">
+                        <table class="table table-vcenter table-hover">
+                            <thead><tr><th>ETF代码</th><th>名称</th><th>市场</th><th>数据源</th><th>操作</th></tr></thead>
+                            <tbody id="etfRows"><tr><td colspan="5" class="table-empty">正在加载ETF列表…</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="pagination">
+                        <button id="etfPrev" type="button">← 上一页</button><span id="etfPageLabel">第 1 页</span>
+                        <button id="etfNext" type="button">下一页 →</button>
+                    </div>
+                </article>
+            </section>
+
+            <section class="view" id="view-runs" data-view="runs">
+                <div class="task-cards" id="taskCards"></div>
+                <article class="card panel">
+                    <div class="panel-head">
+                        <div>
+                            <p class="panel-kicker">TASK QUEUE</p><h3>任务队列</h3>
+                            <p class="panel-description compact-description">扫描和错误重试都会生成独立任务；点击错误数量可查看详情。</p>
+                        </div>
+                        <div class="inline-actions">
+                            <button class="btn secondary-button compact" data-action="refresh-stocks" type="button">刷新股票库</button>
+                            <button class="btn primary-button compact" data-action="scan" type="button">启动扫描</button>
+                            <button class="btn text-button" id="reloadRuns" type="button">刷新记录</button>
+                        </div>
+                    </div>
+                    <div class="table-wrap large-table">
+                        <table class="table table-vcenter table-hover">
+                            <thead><tr><th>任务</th><th>状态</th><th>进度</th><th>处理结果</th><th>错误</th><th>开始时间</th></tr></thead>
+                            <tbody id="runRows"><tr><td colspan="6" class="table-empty">暂无任务记录</td></tr></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+    </div>
+
+    <div class="modal-shell" id="groupModal" hidden>
+        <button class="app-modal-backdrop" data-group-modal-close type="button" aria-label="关闭新建分组"></button>
+        <form class="card modal-card compact-modal-card" id="groupForm">
+            <header class="modal-head">
+                <div><p class="panel-kicker">CUSTOM GROUP</p><h2 id="groupModalTitle">新建分组</h2></div>
+                <button class="btn modal-close" data-group-modal-close type="button" aria-label="关闭">×</button>
+            </header>
+            <div class="modal-form-body">
+                <label for="groupName">分组名称</label>
+                <input class="form-control" id="groupName" maxlength="30" placeholder="例如：自选、长期观察" required>
+                <p>股票分组和ETF分组相互独立，创建后会显示为列表上方的Tab。</p>
+            </div>
+            <footer class="modal-actions">
+                <span>名称最长30个字符</span>
+                <div class="inline-actions">
+                    <button class="btn secondary-button" data-group-modal-close type="button">取消</button>
+                    <button class="btn primary-button compact" type="submit">创建分组</button>
+                </div>
+            </footer>
+        </form>
+    </div>
+
+    <div class="modal-shell" id="assignGroupModal" hidden>
+        <button class="app-modal-backdrop" data-assign-modal-close type="button" aria-label="关闭加入分组"></button>
+        <section class="card modal-card compact-modal-card" role="dialog" aria-modal="true" aria-labelledby="assignGroupTitle">
+            <header class="modal-head">
+                <div><p class="panel-kicker">ADD TO GROUP</p><h2 id="assignGroupTitle">加入自定义分组</h2></div>
+                <button class="btn modal-close" data-assign-modal-close type="button" aria-label="关闭">×</button>
+            </header>
+            <div class="modal-form-body">
+                <p class="assignment-copy" id="assignInstrumentName"></p>
+                <div class="assignment-groups" id="assignGroupOptions"></div>
+            </div>
+            <footer class="modal-actions">
+                <span>同一条目可以加入多个分组</span>
+                <button class="btn secondary-button" data-assign-modal-close type="button">关闭</button>
+            </footer>
+        </section>
+    </div>
+
+    <div class="modal-shell" id="errorModal" hidden>
+        <button class="app-modal-backdrop" data-error-modal-close type="button" aria-label="关闭错误详情"></button>
+        <section class="card modal-card error-modal-card" role="dialog" aria-modal="true" aria-labelledby="errorModalTitle">
+            <header class="modal-head">
+                <div>
+                    <p class="panel-kicker">SCAN ERROR REPORT</p>
+                    <h2 id="errorModalTitle">扫描错误详情</h2>
+                    <p id="errorModalSubtitle">正在读取错误记录…</p>
+                </div>
+                <button class="btn modal-close" data-error-modal-close type="button" aria-label="关闭">×</button>
+            </header>
+            <div class="error-modal-body">
+                <div class="error-summary" id="errorSummary"></div>
+                <div class="error-reason-groups" id="errorReasonGroups"></div>
+                <div class="run-error-message" id="runErrorMessage" hidden></div>
+                <div class="table-wrap modal-table-wrap">
+                    <table class="table table-vcenter table-hover">
+                        <thead><tr><th>股票</th><th>错误类型</th><th>最近错误原因</th><th>重试</th><th>状态</th></tr></thead>
+                        <tbody id="errorRows"><tr><td colspan="5" class="table-empty">正在加载…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+            <footer class="modal-actions">
+                <span id="retryHint">仅重试尚未解决的股票，不会重复扫描全市场。</span>
+                <div class="inline-actions">
+                    <button class="btn secondary-button" data-error-modal-close type="button">关闭</button>
+                    <button class="btn primary-button compact" id="retryErrorsButton" type="button">重试失败股票</button>
+                </div>
+            </footer>
+        </section>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</body>
+</html>

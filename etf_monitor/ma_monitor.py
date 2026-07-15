@@ -1,190 +1,108 @@
-import pandas as pd
-from datetime import datetime, timedelta
-from eastmoney_crawler import EastMoneyAPI
-from gui_utils import NotificationManager
-from common.log_utils import LoggerManager
+"""ETF 均线计算、穿越识别和去重通知。"""
 
-# 初始化东方财富API
-api = EastMoneyAPI()
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+from common.log_utils import LoggerManager
+from market_data.service import get_default_service
+
+from .gui_utils import NotificationManager
+
+
+MA_WINDOWS = (10, 30, 60)
 notify = NotificationManager()
 
-def get_ma_data(ts_code, period='D', start_date=None, end_date=None, ts_name=None):
-    """
-    获取ETF在指定周期的数据并计算移动平均线
-    
-    参数：
-        ts_code: ETF代码
-        period: 周期，支持：
-            - 1min/5min/15min/30min/60min - 分钟
-            - 120min - 2小时（由60分钟数据合并得到）
-            - D - 日线
-        start_date: 开始日期
-        end_date: 结束日期
-        ts_name: ETF中文名称
-    """
-    # 如果没有提供中文名称，使用代码作为名称
-    if ts_name is None:
-        ts_name = ts_code
-        
-    # 使用日志工具类获取日志记录器
+
+def get_ma_data(ts_code, period="D", start_date=None, end_date=None, ts_name=None, service=None, minimum_trade_time=None):
+    """从统一行情服务读取K线，并计算不同窗口的移动平均线。"""
+    ts_name = ts_name or ts_code
     logger = LoggerManager.get_logger(f"{ts_code}_{ts_name}")
-    
-    if start_date is None:
-        start_date = (datetime.today() - timedelta(days=120)).strftime('%Y%m%d')
-    if end_date is None:
-        end_date = datetime.today().strftime('%Y%m%d')
-    
-    # 提取纯代码（去掉可能的后缀如.SZ）
-    symbol = ts_code.split('.')[0]
-        
+    start_date = start_date or (datetime.today() - timedelta(days=120)).strftime("%Y%m%d")
+    end_date = end_date or datetime.today().strftime("%Y%m%d")
+    market_data_service = service or get_default_service()
     try:
-        if period == 'D':
-            df = api.get_daily_data(symbol, start_date, end_date)
-        elif period == '120min':
-            # 调用合并60分钟数据的函数
-            df = api.merge_60min_to_120min(symbol, start_date, end_date)
+        if period == "D":
+            data = market_data_service.get_daily_data(ts_code, start_date, end_date)
         else:
-            df = api.get_minute_data(symbol, period, start_date, end_date)
-            
-        if df is None or df.empty:
+            data = market_data_service.get_minute_data(
+                ts_code, period, start_date, end_date, minimum_trade_time=minimum_trade_time
+            )
+        if data is None or data.empty:
             return None
-            
-        # 按时间正序排列
-        df = df.sort_values('trade_date' if period == 'D' else 'trade_time')
-        
-        # 计算移动平均线
-        df['MA10'] = df['close'].rolling(window=10).mean()
-        df['MA30'] = df['close'].rolling(window=30).mean()
-        df['MA60'] = df['close'].rolling(window=60).mean()
-        
-        return df
-    except Exception as e:
-        logger.error(f"获取数据失败：{str(e)}")
+        data = data.sort_values("trade_time").reset_index(drop=True)
+        for window in MA_WINDOWS:
+            data[f"MA{window}"] = data["close"].rolling(window=window).mean()
+        return data
+    except Exception as exc:
+        logger.exception("获取数据失败：%s", exc)
         return None
 
 
-def check_ma_cross(df, ts_code=None, period_name=None, ts_name=None):
-    """
-    检查是否上穿三条均线
-    返回：
-        - True: 当前价格在三条均线上方
-        - False: 当前价格未在三条均线上方
-    
-    参数：
-        df: 数据框
-        ts_code: 股票或ETF代码
-        period_name: 周期名称
-        ts_name: 股票或ETF中文名称
-    """
-    if df is None or df.empty or len(df) < 2:
+def detect_ma_crosses(data):
+    """比较相邻两根K线各自的价格和均线，返回真正发生的穿越方向。"""
+    crosses = {window: None for window in MA_WINDOWS}
+    if data is None or data.empty or len(data) < 2:
+        return crosses
+    latest = data.iloc[-1]
+    previous = data.iloc[-2]
+    for window in MA_WINDOWS:
+        column = f"MA{window}"
+        current_ma = latest[column]
+        previous_ma = previous[column]
+        if pd.isna(current_ma) or pd.isna(previous_ma):
+            continue
+        if previous["close"] <= previous_ma and latest["close"] > current_ma:
+            crosses[window] = "up"
+        elif previous["close"] >= previous_ma and latest["close"] < current_ma:
+            crosses[window] = "down"
+    return crosses
+
+
+def check_ma_cross(data, ts_code=None, period_name=None, ts_name=None, service=None):
+    """记录均线位置，只对新K线上的真实穿越发送一次通知。"""
+    if data is None or data.empty or len(data) < 2:
         return False
-    
-    # 如果没有提供中文名称，使用代码作为名称
-    if ts_name is None:
-        ts_name = ts_code
-    
-    # 使用日志工具类获取日志记录器
+    ts_name = ts_name or ts_code
     logger = LoggerManager.get_logger(f"{ts_code}_{ts_name}") if ts_code else None
-        
-    # 获取最新一条和前一条数据
-    latest = df.iloc[-1]
-    previous = df.iloc[-2]
-    
-    # 检查当前价格是否在三条均线上方
-    price = latest['close']
-    ma10 = latest['MA10']
-    ma30 = latest['MA30']
-    ma60 = latest['MA60']
-    
-    # 获取前一个周期的价格（但使用当前周期的均线数据）
-    prev_price = previous['close']
-    
-    # 判断是否存在空值
-    if pd.isna(ma10) or pd.isna(ma30) or pd.isna(ma60):
+    latest = data.iloc[-1]
+    crosses = detect_ma_crosses(data)
+    should_notify_period = period_name in {"30min线", "60min线", "120min线"}
+    market_data_service = service or get_default_service()
+
+    for window in MA_WINDOWS:
+        moving_average = latest[f"MA{window}"]
+        if pd.isna(moving_average):
+            continue
+        position = "上方" if latest["close"] > moving_average else "下方"
+        direction = crosses[window]
+        if logger:
+            if direction:
+                action = "上穿" if direction == "up" else "下穿"
+                message = f"{ts_code} ({ts_name}) 在 {period_name} 当前价格{action}了{window}周期均线"
+                logger.info(message)
+                notification_key = f"{ts_code}:{period_name}:MA{window}:{direction}"
+                trade_time = latest["trade_time"]
+                if should_notify_period and market_data_service.database.should_send_notification(
+                    notification_key, trade_time, direction
+                ):
+                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
+            else:
+                logger.info("%s (%s) 在 %s 当前价格位于%d周期均线%s", ts_code, ts_name, period_name, window, position)
+
+    valid_averages = [latest[f"MA{window}"] for window in MA_WINDOWS]
+    if any(pd.isna(value) for value in valid_averages):
         return False
-    
-    # 只有当提供了代码和周期名称时才记录详细信息
-    if ts_code and period_name and logger:
-        # 判断是否需要发送通知（只在30分钟和60分钟周期）
-        should_notify = period_name in ['30min线', '60min线', '120min线']
-        
-        # 判断是否上穿10日均线或下穿10日均线
-        if price > ma10:
-            if prev_price <= ma10:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格上穿了10日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在10日均线上方")
-        else:
-            if prev_price >= ma10:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格下穿了10日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在10日均线下方")
-        
-        # 判断是否上穿30日均线或下穿30日均线
-        if price > ma30:
-            if prev_price <= ma30:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格上穿了30日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在30日均线上方")
-        else:
-            if prev_price >= ma30:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格下穿了30日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在30日均线下方")
-                
-        # 判断是否上穿60日均线或下穿60日均线
-        if price > ma60:
-            if prev_price <= ma60:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格上穿了60日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在60日均线上方")
-        else:
-            if prev_price >= ma60:
-                message = f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格下穿了60日均线"
-                if should_notify:
-                    notify.show_notification(f"{ts_code} ({ts_name})", message, 5)
-                logger.info(message)
-            else:
-                logger.info(f"{ts_code} ({ts_name}) 在 {period_name} 周期当前价格持续在60日均线下方")
-
-    # 判断价格是否在三条均线上方
-    return price > ma10 and price > ma30 and price > ma60
+    return all(latest["close"] > value for value in valid_averages)
 
 
-def monitor_etf(ts_code, period='D', ts_name=None):
-    """
-    监控ETF在指定周期的均线状态
-    
-    参数：
-        ts_code: ETF代码
-        period: 周期，支持 1min/5min/15min/30min/60min/D
-        ts_name: ETF中文名称
-    """
-    # 如果没有提供中文名称，使用代码作为名称
-    if ts_name is None:
-        ts_name = ts_code
-        
-    # 使用日志工具类获取日志记录器
-    logger = LoggerManager.get_logger(f"{ts_code}_{ts_name}")
-    
-    df = get_ma_data(ts_code, period)
-    if df is not None:
-        period_name = '日线' if period == 'D' else f'{period}线'
-        is_above_ma = check_ma_cross(df, ts_code, period_name, ts_name)
-        return is_above_ma
-    return False
+def monitor_etf(ts_code, period="D", ts_name=None, service=None):
+    """兼容原有单个ETF监控入口。"""
+    ts_name = ts_name or ts_code
+    data = get_ma_data(ts_code, period, ts_name=ts_name, service=service)
+    if data is None:
+        return False
+    if period != "D" and data["trade_time"].max().date() != datetime.now().date():
+        return False
+    period_name = "日线" if period == "D" else f"{period}线"
+    return check_ma_cross(data, ts_code, period_name, ts_name, service)

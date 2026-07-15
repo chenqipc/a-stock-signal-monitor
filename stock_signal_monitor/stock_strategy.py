@@ -1,83 +1,47 @@
-import tushare as ts
 from datetime import datetime, timedelta
-from common.tushare_token import tushare_token
-from common.StockEnum import StockStatus
+from decimal import Decimal, ROUND_HALF_UP
+from math import ceil
 
-import baostock as bs
 import pandas as pd
 
+from common.StockEnum import StockStatus
+from market_data.service import get_default_service
 
-def daily_check(ts_code, stock_name):
-    # 登录baostock
-    lg = bs.login()
+
+def daily_check(ts_code, stock_name, service=None):
     # 排除ST股票
     if 'ST' in stock_name:
         return [StockStatus.NO_MATCH]
 
-    # 排除北交所股票 (ts_code 以 '8' 开头) 和科创板股票 (ts_code 以 '688' 开头)
-    if ts_code.startswith('8') or ts_code.startswith('688'):
+    # 延续原策略范围：排除北交所与科创板，北交所代码可能以4或8开头。
+    if ts_code.startswith(('4', '8', '92', '688')):
         return [StockStatus.NO_MATCH]
 
     # 获取当前日期
     today = datetime.today()
-    fifteen_days_ago = today - timedelta(days=200)
-    start_date = fifteen_days_ago.strftime('%Y-%m-%d')
-    end_date = today.strftime('%Y-%m-%d')
+    history_start = today - timedelta(days=200)
+    start_date = history_start.strftime('%Y%m%d')
+    end_date = today.strftime('%Y%m%d')
 
-    ts_code.replace('.', '.')
-    rs = bs.query_history_k_data_plus(
-        ts_code,  # baostock用类似"sz.000001"
-        "date,code,open,high,low,close,volume,amount,pctChg",
-        start_date=start_date,
-        end_date=end_date,
-        frequency="d",
-        adjustflag="3"
-    )
-
-    # 转为DataFrame
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    daily_data = pd.DataFrame(data_list, columns=rs.fields)
-
-    # 字段名适配
-    daily_data.rename(columns={
-        "volume": "vol",
-        "pctChg": "pct_chg"
-    }, inplace=True)
-
-    # 统一类型转换
-    for col in ["open", "high", "low", "close", "vol", "amount", "pct_chg"]:
-        daily_data[col] = daily_data[col].astype(float)
-
-    # print(daily_data)
-
-    # 获取流通股本
-    rs2 = bs.query_stock_basic(code=ts_code)
-    float_share = None
-    while rs2.next():
-        print(rs2.get_row_data())
-        float_share = float(rs2.get_row_data()[8]) * 10000  # floatShare字段，单位万股
-        print("float_share:%s" % float_share)
-    daily_data["turnover_rate"] = daily_data["vol"] / float_share * 100
-
-    bs.logout()
+    # 通过统一服务按免费网络源、可选付费兜底、SQLite缓存的顺序自动降级。
+    market_data_service = service or get_default_service()
+    daily_data = market_data_service.get_daily_data(ts_code, start_date, end_date)
 
     # 检查数据是否足够（至少有7天数据）
     if len(daily_data) >= 7:
         # 排序为正序，最新的在最后
-        daily_data = daily_data.sort_values(by='date', ascending=True)
+        daily_data = daily_data.sort_values(by='trade_date', ascending=True)
         # 重置索引，但保持排序
         daily_data = daily_data.reset_index(drop=True)
 
         result = []  # 初始化一个结果列表
 
         # 检查是否连续3天涨停 done
-        if is_limit_up_3days(daily_data):
+        if is_limit_up_3days(daily_data, ts_code):
             result.append(StockStatus.THREE_LIMIT_UP)
 
         # 检查是否只有3天涨停 done
-        if is_limit_up_only_3days(daily_data):
+        if is_limit_up_only_3days(daily_data, ts_code):
             result.append(StockStatus.THREE_LIMIT_UP_ONLY)
 
         # 检查连续3天上涨且成交量逐步放大 done
@@ -105,7 +69,7 @@ def daily_check(ts_code, stock_name):
             result.append(StockStatus.MACD_GOLDEN_CROSS)
 
         # 检查最近7天是否出现MACD金叉 done
-        if is_macd_golden_cross(daily_data, days=7):
+        if is_macd_golden_cross_7(daily_data):
             result.append(StockStatus.MACD_GOLDEN_CROSS_OVER_7)
 
         # 双底结构 done
@@ -124,13 +88,12 @@ def daily_check(ts_code, stock_name):
         if is_upward_trend(daily_data):
             result.append(StockStatus.IS_UPWARD_TREND)
 
-        # if is_funds_inflow_by_volume_turnover(daily_data):
-        #     result.append(StockStatus.FUNDS_INFLOW_BY_VOLUME_TURNOVER)
+        if is_funds_inflow_by_volume_turnover(daily_data):
+            result.append(StockStatus.FUNDS_INFLOW_BY_VOLUME_TURNOVER)
 
         return result if result else [StockStatus.NO_MATCH]
 
     return [StockStatus.NO_MATCH]
-
 
 def get_recent_days_data(daily_data, days=30, sort=False):
     """
@@ -139,7 +102,7 @@ def get_recent_days_data(daily_data, days=30, sort=False):
     参数:
     daily_data (pd.DataFrame): 原始数据，假设包含日期索引。
     days (int): 要获取的最近天数，默认为30天。
-    sort (bool): 是否按日期索引排序，默认为True。如果数据已经排序，可以设置为False以提高效率。
+    sort (bool): 是否按日期索引排序，默认为False。如果数据已经排序，可以保持False以提高效率。
 
     返回:
     pd.DataFrame: 最近指定天数的数据。
@@ -161,7 +124,31 @@ def get_recent_days_data(daily_data, days=30, sort=False):
 # 假设 daily_data 是一个已经按日期索引排序的Pandas DataFrame
 # recent_30_days_data = get_recent_days_data(daily_data)
 
-def is_limit_up_3days(daily_data):
+def get_price_limit_ratio(ts_code, is_st=False):
+    """按证券范围返回涨跌停比例，避免用统一9.89%判断所有板块。"""
+    code = str(ts_code).split('.')[0]
+    if is_st:
+        return Decimal('0.05')
+    if code.startswith(('4', '8', '92')):
+        return Decimal('0.30')
+    if code.startswith(('300', '301', '688')):
+        return Decimal('0.20')
+    return Decimal('0.10')
+
+
+def is_limit_up_row(row, ts_code):
+    """优先按前收价计算交易所价格精度下的涨停价，字段不足时才使用涨幅兜底。"""
+    is_st = bool(row.get('is_st', False))
+    ratio = get_price_limit_ratio(ts_code, is_st)
+    pre_close = row.get('pre_close')
+    close = row.get('close')
+    if pre_close is not None and close is not None and pre_close > 0:
+        limit_price = (Decimal(str(pre_close)) * (Decimal('1') + ratio)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return Decimal(str(close)) >= limit_price
+    return row.get('pct_chg', float('-inf')) >= float(ratio * 100) - 0.01
+
+
+def is_limit_up_3days(daily_data, ts_code=''):
     """判断是否连续3天涨停"""
     # 确保有足够的天数进行判断
     if len(daily_data) < 3:
@@ -169,39 +156,22 @@ def is_limit_up_3days(daily_data):
 
     # recent_30_days_data = get_recent_days_data(daily_data)
 
-    return all(daily_data['pct_chg'].iloc[-3:] >= 9.89)
+    return all(is_limit_up_row(row, ts_code) for _, row in daily_data.iloc[-3:].iterrows())
 
 
-def is_limit_up_only_3days(daily_data):
+def is_limit_up_only_3days(daily_data, ts_code=''):
     """
     判断最近三天（不包括更早）是否连续3天涨停。
     如果涨停超过3天，则过滤掉。
     :param daily_data: 股票的每日数据，按日期升序排列
     :return: 如果满足条件返回True，否则返回False
     """
-    # 确保数据至少有三天
-    if len(daily_data) < 3:
+    # 需要第4天判断这是否恰好是连续3个涨停。
+    if len(daily_data) < 4:
         return False
-
-    only_3days = get_recent_days_data(daily_data, days=6)
-
-    # 检查最近3天是否连续涨停（从最后一天倒数三天的数据）
-    last_3_days_pct_chg = only_3days['pct_chg'].iloc[-3:]
-
-    # 检查是否这三天的涨幅都大于等于9.89%（即为涨停）
-    is_recent_3days_limit_up = all(last_3_days_pct_chg >= 9.89)
-
-    if not is_recent_3days_limit_up:
-        return False
-
-    # 如果更早的涨停也存在，则排除
-    if len(only_3days) > 3:
-        earlier_pct_chg = only_3days['pct_chg'].iloc[:-3]
-        # 如果更早的涨幅也有涨停，过滤掉这种情况
-        if any(earlier_pct_chg >= 9.89):
-            return False
-
-    return is_recent_3days_limit_up
+    recent_rows = daily_data.iloc[-3:]
+    previous_row = daily_data.iloc[-4]
+    return all(is_limit_up_row(row, ts_code) for _, row in recent_rows.iterrows()) and not is_limit_up_row(previous_row, ts_code)
 
 
 def is_rising_with_volume_increase(daily_data, days=3):
@@ -231,7 +201,7 @@ def is_volume_surge_with_price_rise(daily_data, days=3, reference_days=7, volume
     consecutive_rise_days (int): 连续上涨的天数要求，默认值为2天，即需要连续满足放量上涨的天数。
 
     返回:
-    bool: 如果在最近 days 天内，满足有 consecutive_rise_days 天连续出现成交量至少达到参考成交量的 volume_multiplier 倍且价格上涨的情况，则返回 True；否则返回 False。
+    bool: 如果最近 days 天内连续出现至少 consecutive_rise_days 天放量上涨，则返回 True；否则返回 False。
     """
     # 检查数据长度是否足够进行后续判断
     # 如果 daily_data 的行数少于 days + reference_days，说明数据量不足以进行计算，直接返回 False
@@ -302,24 +272,18 @@ def is_capital_inflow(daily_data, min_threshold=0.90, days=3, reference_days=7, 
     if recent_avg_amount < reference_avg_amount * volume_increase_threshold:
         return False  # 最近days天的成交额没有显著增加，返回False
 
-    # 检查过去days天的成交额和涨幅
-    for i in range(1, days):
-        amount_today = daily_data['amount'].iloc[-i]
-        amount_yesterday = daily_data['amount'].iloc[-i - 1]
-        price_change = daily_data['pct_chg'].iloc[-i]
-
-        # 判断成交额不减少超过min_threshold，且股价涨幅为正
-        if amount_today >= amount_yesterday * min_threshold and price_change > 0:
-            continue  # 继续判断下一天
-        else:
-            return False  # 如果不满足条件，则返回False
-
-    return True  # 如果连续n天都满足条件，则返回True
+    recent_data = daily_data.iloc[-days:]
+    if not all(recent_data['pct_chg'] > 0):
+        return False
+    return all(
+        recent_data['amount'].iloc[index] >= recent_data['amount'].iloc[index - 1] * min_threshold
+        for index in range(1, len(recent_data))
+    )
 
 
 def is_stock_stabilizing(daily_data, days=5):
     """
-    判断股票是否出现企稳迹象，但涨幅不大。10日线上穿5日线
+    判断股票是否出现企稳迹象，但涨幅不大。5日线上穿10日线。
 
     条件：
     1. 价格在低点附近形成支撑并开始反弹，但涨幅不大（2% - 5%）。
@@ -339,11 +303,9 @@ def is_stock_stabilizing(daily_data, days=5):
     daily_data['MA10'] = daily_data['close'].rolling(window=10).mean()
 
     # 最近days天的5日均线和10日均线
-    recent_ma5 = daily_data['MA5'].iloc[-days:]
-    recent_ma10 = daily_data['MA10'].iloc[-days:]
-
-    # 判断5日均线是否逐渐上穿10日均线
-    ma_crossover = all(recent_ma5.iloc[-i] > recent_ma10.iloc[-i] for i in range(1, 2))
+    # 最近窗口内必须实际发生“前一日不高于、当前日高于”的穿越。
+    crossover = (daily_data['MA5'] > daily_data['MA10']) & (daily_data['MA5'].shift(1) <= daily_data['MA10'].shift(1))
+    ma_crossover = bool(crossover.iloc[-days:].any())
 
     # 1. 判断是否形成低点支撑（最近days天中，价格相对较低并开始反弹）
     # 条件：当前的收盘价相对前几天的价格略有上涨，表明反弹初期
@@ -365,7 +327,7 @@ def is_stock_stabilizing(daily_data, days=5):
     return False
 
 
-def is_stock_stabilizing_over60(daily_data, days=5, tolerance=0.1):
+def is_stock_stabilizing_over60(daily_data, days=5, tolerance=0.05):
     """
     判断股票是否出现企稳迹象，并且反弹刚突破60日均线。
 
@@ -379,7 +341,7 @@ def is_stock_stabilizing_over60(daily_data, days=5, tolerance=0.1):
     :return: True如果股票出现企稳迹象，False否则
     """
     # 确保有足够的天数进行判断
-    if len(daily_data) < 60:  # 需要至少60天的数据来计算60日均线
+    if len(daily_data) < 61:  # 上一日和当前日都需要有效的60日均线
         return False
 
     # 计算60日均线
@@ -391,10 +353,13 @@ def is_stock_stabilizing_over60(daily_data, days=5, tolerance=0.1):
     last_close_price = recent_prices.iloc[-1]
     last_ma60 = recent_ma60.iloc[-1]
 
-    # 1. 判断是否刚刚突破60日均线
-    # 条件：当前收盘价大于60日均线，但不能超过60日均线的 tolerance 比例（默认5%）
-    if last_close_price <= last_ma60:
-        return False  # 如果还没有突破60日均线，则不认为是企稳
+    # 必须从均线下方真实穿越到上方，而不是仅判断当前仍在均线上方。
+    previous_close = daily_data['close'].iloc[-2]
+    previous_ma60 = daily_data['ma60'].iloc[-2]
+    if pd.isna(previous_ma60) or pd.isna(last_ma60):
+        return False
+    if previous_close > previous_ma60 or last_close_price <= last_ma60:
+        return False
 
     if last_close_price > last_ma60 * (1 + tolerance):
         return False  # 如果股价已经大幅高于60日均线，则过滤掉
@@ -559,8 +524,8 @@ def is_breakout_after_consolidation(daily_data, consolidation_days=30, recent_da
     :param daily_data: 股票的每日数据（DataFrame）
     :param consolidation_days: 横盘期的天数，默认是30天
     :param recent_days: 检查最近几天内的表现，默认是5天
-    :param price_threshold: 检查横盘期股价波动的阈值，默认是2%
-    :param volume_increase_threshold: 成交量放大的阈值，默认是1.5倍
+    :param price_threshold: 检查横盘期股价波动的阈值，默认是5%
+    :param volume_increase_threshold: 成交量放大的阈值，默认是1.2倍
     :return: 如果满足横盘期后的放量上涨条件，返回True，否则返回False
     """
     if len(daily_data) < consolidation_days + recent_days:
@@ -602,7 +567,7 @@ def is_upward_trend(daily_data):
     3. MACD金叉
     """
     # 确保有足够数据
-    if len(daily_data) < 20:
+    if len(daily_data) < 61:
         return False
 
     # 1. 检查是否刚刚突破阻力位（如均线）
@@ -675,17 +640,23 @@ def is_funds_inflow_by_volume_turnover(daily_data, n=7, m=30, ratio=1.2, pct_pos
     """
     if len(daily_data) < n + m:
         return False
+        
+    # 检查数据中是否包含换手率字段
+    turnover_field = 'turnover_rate' if 'turnover_rate' in daily_data.columns else 'tor'
+    if turnover_field not in daily_data.columns:
+        print(f"数据中缺少换手率字段: {daily_data.columns}")
+        return False
 
     vol_recent = daily_data['vol'].iloc[-n:].mean()
     vol_ref = daily_data['vol'].iloc[-(n + m):-n].mean()
-    turnover_recent = daily_data['turnover_rate'].iloc[-n:].mean()
-    turnover_ref = daily_data['turnover_rate'].iloc[-(n + m):-n].mean()
+    turnover_recent = daily_data[turnover_field].iloc[-n:].mean()
+    turnover_ref = daily_data[turnover_field].iloc[-(n + m):-n].mean()
 
     # 判断成交量和换手率均放大
     if vol_recent > vol_ref * ratio and turnover_recent > turnover_ref * ratio:
         # 统计最近n天正涨幅天数
         positive_days = (daily_data['pct_chg'].iloc[-n:] > 0).sum()
-        if positive_days >= int(n * pct_positive):
+        if positive_days >= ceil(n * pct_positive):
             return True
     return False
 
