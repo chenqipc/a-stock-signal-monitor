@@ -170,8 +170,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# 本地行情缓存及SQLite运行时文件
+# 提交可复用的行情快照，继续忽略其他本地数据库和SQLite运行时文件
 *.db
+!resource/market_data.db
 *.db-shm
 *.db-wal
 双底结构.txt
