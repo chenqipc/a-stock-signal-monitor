@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+    <title>A-Stock Signal Monitor</title>
+    <defs>
+        <linearGradient id="bg" x1="12" y1="8" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#0E3B2E"/>
+            <stop offset="1" stop-color="#061A17"/>
+        </linearGradient>
+        <linearGradient id="signal" x1="14" y1="45" x2="50" y2="20" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#22D3EE"/>
+            <stop offset="1" stop-color="#6EE7B7"/>
+        </linearGradient>
+    </defs>
+    <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+    <path d="M14 46h36" stroke="#1F4B43" stroke-width="3" stroke-linecap="round"/>
+    <path d="M15 43l9-10 8 5 8-15 9 6" fill="none" stroke="url(#signal)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="40" cy="23" r="6" fill="#F59E0B"/>
+    <circle cx="40" cy="23" r="2.5" fill="#FFF7ED"/>
+    <path d="M18 18h11" stroke="#D1FAE5" stroke-width="4" stroke-linecap="round"/>
+    <path d="M18 27h6" stroke="#6EE7B7" stroke-width="4" stroke-linecap="round"/>
+</svg>

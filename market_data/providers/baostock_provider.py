@@ -100,6 +100,8 @@ class BaoStockProvider:
     def fetch_bars(self, symbol, period, start_date, end_date):
         if period not in self.supported_periods:
             raise ProviderUnavailableError(f"BaoStock 不支持周期: {period}")
+        if not self.supports_symbol(symbol):
+            raise ProviderUnavailableError(f"BaoStock 不支持证券市场: {symbol}")
         if period == "120min":
             return self._merge_60min_to_120min(self.fetch_bars(symbol, "60min", start_date, end_date))
         frequency = "d" if period == "D" else period.replace("min", "")
@@ -128,6 +130,12 @@ class BaoStockProvider:
             data = data.rename(columns={"time": "trade_time", "volume": "vol"})
             data["trade_time"] = data["trade_time"].str[:14]
         return self._normalize_bars(data)
+
+    @staticmethod
+    def supports_symbol(symbol):
+        """BaoStock 仅支持沪深北代码，港股和海外指数不进入登录及查询流程。"""
+        normalized = str(symbol).strip().upper()
+        return normalized.startswith(("SH.", "SZ.", "BJ.")) or normalized.endswith((".SH", ".SZ", ".BJ"))
 
     @staticmethod
     def _merge_60min_to_120min(data):

@@ -12,12 +12,23 @@ from market_data.config import (
     MIN_STOCK_LIST_SIZE,
     MINUTE_CACHE_TTL_SECONDS,
     PROVIDER_MAX_RETRIES,
+    PROVIDER_RETRY_MAX_DELAY_SECONDS,
+    TUSHARE_DAILY_REQUEST_LIMIT,
+    TUSHARE_REQUESTS_PER_MINUTE,
     get_database_journal_mode,
     get_database_path,
+    get_tushare_tokens,
 )
 from market_data.database import MarketDataDatabase
 from market_data.exceptions import MarketDataError, ProviderUnavailableError
-from market_data.providers import BaoStockProvider, EastMoneyProvider, SinaProvider
+from market_data.providers import (
+    BaoStockProvider,
+    EastMoneyProvider,
+    ShanghaiGoldExchangeProvider,
+    SinaProvider,
+    TencentProvider,
+    YahooFinanceProvider,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,31 +55,47 @@ class MarketDataService:
         self._now = now_provider or datetime.now
         baostock_provider = BaoStockProvider() if daily_providers is None or minute_providers is None else None
         eastmoney_provider = EastMoneyProvider() if daily_providers is None or minute_providers is None else None
-        sina_provider = SinaProvider() if minute_providers is None else None
-        self.daily_providers = daily_providers if daily_providers is not None else [baostock_provider, eastmoney_provider]
+        yahoo_provider = YahooFinanceProvider() if daily_providers is None else None
+        sge_provider = ShanghaiGoldExchangeProvider() if daily_providers is None else None
+        sina_provider = SinaProvider() if daily_providers is None or minute_providers is None else None
+        tencent_provider = TencentProvider() if daily_providers is None else None
+        # 各专用源通过supports_symbol跳过无关证券，A股保持BaoStock -> 新浪 -> 腾讯 -> 东方财富的降级顺序。
+        self.daily_providers = daily_providers if daily_providers is not None else [
+            baostock_provider, yahoo_provider, sge_provider, sina_provider, tencent_provider, eastmoney_provider
+        ]
         self.minute_providers = minute_providers if minute_providers is not None else [
             baostock_provider,
             eastmoney_provider,
             sina_provider,
         ]
-        if ENABLE_TUSHARE_FALLBACK and daily_providers is None:
+        if daily_providers is None:
             from market_data.providers.tushare_provider import TushareProvider
 
-            self.daily_providers.append(TushareProvider())
+            tushare_tokens = get_tushare_tokens()
+            if tushare_tokens:
+                self.daily_providers.append(TushareProvider(tushare_tokens, TUSHARE_REQUESTS_PER_MINUTE, TUSHARE_DAILY_REQUEST_LIMIT))
+            elif ENABLE_TUSHARE_FALLBACK:
+                logger.warning("已启用Tushare兜底，但未在环境变量或本机私密配置中找到Token")
 
-    def get_bars(self, symbol, period, start_date, end_date, force_refresh=False, minimum_trade_time=None):
+    def get_bars(
+        self, symbol, period, start_date, end_date, force_refresh=False, minimum_trade_time=None, refresh_latest=False
+    ):
         normalized_symbol = self.normalize_symbol(symbol)
         cached = self.database.load_klines(normalized_symbol, period, start_date, end_date)
         daily_target = self._latest_completed_daily_date(end_date) if period == "D" else None
+        if period == "D" and refresh_latest:
+            daily_target = pd.Timestamp(min(pd.Timestamp(end_date).date(), self._now().date()))
         daily_start_covered = False
         if period == "D":
             daily_start_covered = self._daily_start_is_covered(normalized_symbol, cached, start_date)
             cache_ready = self._daily_cache_covers(normalized_symbol, cached, start_date, daily_target)
+            cache_ready = cache_ready and self._daily_data_has_chart_fields(cached)
+            cache_ready = cache_ready and self._meets_minimum_trade_time(cached, minimum_trade_time)
         else:
             cache_ready = self._cache_is_fresh(normalized_symbol, period, MINUTE_CACHE_TTL_SECONDS)
             cache_ready = cache_ready and self._cache_covers_range(cached, start_date, end_date, period)
             cache_ready = cache_ready and self._meets_minimum_trade_time(cached, minimum_trade_time)
-        if not force_refresh and not cached.empty and cache_ready:
+        if not force_refresh and not refresh_latest and not cached.empty and cache_ready:
             result = self._prepare_result(cached)
             result.attrs["source"] = "sqlite_cache"
             result.attrs["cached_sources"] = sorted(cached["source"].dropna().unique().tolist())
@@ -85,12 +112,15 @@ class MarketDataService:
         for provider in providers:
             if period not in provider.supported_periods:
                 continue
+            if hasattr(provider, "supports_symbol") and not provider.supports_symbol(normalized_symbol):
+                continue
             try:
                 fresh = self._fetch_with_retry(provider, normalized_symbol, period, fetch_start, fetch_end)
                 if fresh is None or fresh.empty:
                     raise ProviderUnavailableError("返回空数据")
                 if not self._provider_data_is_fresh(fresh, period, fetch_end, minimum_trade_time):
-                    raise ProviderUnavailableError("分钟行情未包含当前交易日数据")
+                    freshness_error = "日线行情未包含目标交易日数据" if period == "D" else "分钟行情未包含当前交易日数据"
+                    raise ProviderUnavailableError(freshness_error)
                 actual_fetch_start = fetch_start
                 if period == "D" and not force_refresh and self._adjusted_history_changed(cached, fresh):
                     # 除权除息会改变前复权历史价格，仅在检测到变化时重取完整策略窗口。
@@ -113,7 +143,8 @@ class MarketDataService:
                 return result
             except Exception as exc:
                 errors.append(f"{provider.name}: {exc}")
-                logger.warning("行情源 %s 获取 %s %s 失败: %s", provider.name, normalized_symbol, period, exc)
+                log_method = logger.info if self._is_expected_provider_miss(provider, period, exc) else logger.warning
+                log_method("行情源 %s 获取 %s %s 失败: %s", provider.name, normalized_symbol, period, exc)
 
         if not cached.empty:
             cached = self._prepare_result(cached)
@@ -122,8 +153,28 @@ class MarketDataService:
             return cached
         raise MarketDataError(f"所有行情源均不可用，{normalized_symbol} {period}: {'; '.join(errors)}")
 
-    def get_daily_data(self, symbol, start_date, end_date, force_refresh=False):
-        return self.get_bars(symbol, "D", start_date, end_date, force_refresh)
+    @staticmethod
+    def _is_expected_provider_miss(provider, period, exc):
+        message = str(exc)
+        return provider.name == "baostock" and period == "D" and (
+            "日线行情未包含目标交易日数据" in message or "返回空数据" in message
+        )
+
+    def get_daily_data(self, symbol, start_date, end_date, force_refresh=False, minimum_trade_time=None, refresh_latest=False):
+        return self.get_bars(symbol, "D", start_date, end_date, force_refresh, minimum_trade_time, refresh_latest)
+
+    def daily_cache_ready(self, symbol, start_date, end_date):
+        normalized_symbol = self.normalize_symbol(symbol)
+        cached = self.database.load_klines(normalized_symbol, "D", start_date, end_date)
+        target = self._latest_completed_daily_date(end_date)
+        return self._daily_data_has_chart_fields(cached) and self._daily_cache_covers(normalized_symbol, cached, start_date, target)
+
+    def get_cached_daily_data(self, symbol, start_date, end_date):
+        normalized_symbol = self.normalize_symbol(symbol)
+        cached = self.database.load_klines(normalized_symbol, "D", start_date, end_date)
+        result = self._prepare_result(cached)
+        result.attrs["source"] = "sqlite_cache"
+        return result
 
     def get_minute_data(self, symbol, period, start_date, end_date, force_refresh=False, minimum_trade_time=None):
         return self.get_bars(symbol, period, start_date, end_date, force_refresh, minimum_trade_time)
@@ -136,7 +187,7 @@ class MarketDataService:
             except Exception as exc:
                 last_error = exc
                 if attempt + 1 < self.max_retries:
-                    delay_seconds = min(2 ** attempt, 4)
+                    delay_seconds = min(2 ** attempt, PROVIDER_RETRY_MAX_DELAY_SECONDS)
                     import time
 
                     time.sleep(delay_seconds)
@@ -326,6 +377,17 @@ class MarketDataService:
             if ((cached_values - fresh_values).abs() > tolerance).fillna(False).any():
                 return True
         return False
+
+    @staticmethod
+    def _daily_data_has_volume(data):
+        """成交量是策略计算和日线详情的基础字段，旧缓存完全缺失时必须重新补取。"""
+        return bool(data is not None and not data.empty and "vol" in data.columns and data["vol"].notna().any())
+
+    @staticmethod
+    def _daily_data_has_chart_fields(data):
+        """专业日线图和策略计算共同依赖OHLCV，任一核心字段完全缺失都需要补数。"""
+        required_columns = ("open", "high", "low", "close", "vol")
+        return data is not None and not data.empty and all(column in data and data[column].notna().any() for column in required_columns)
 
     @staticmethod
     def _cache_covers_range(cached, start_date, end_date, period):

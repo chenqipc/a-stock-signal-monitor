@@ -17,11 +17,7 @@ def daily_check(ts_code, stock_name, service=None):
     if ts_code.startswith(('4', '8', '92', '688')):
         return [StockStatus.NO_MATCH]
 
-    # 获取当前日期
-    today = datetime.today()
-    history_start = today - timedelta(days=200)
-    start_date = history_start.strftime('%Y%m%d')
-    end_date = today.strftime('%Y%m%d')
+    start_date, end_date = daily_strategy_window()
 
     # 通过统一服务按免费网络源、可选付费兜底、SQLite缓存的顺序自动降级。
     market_data_service = service or get_default_service()
@@ -94,6 +90,13 @@ def daily_check(ts_code, stock_name, service=None):
         return result if result else [StockStatus.NO_MATCH]
 
     return [StockStatus.NO_MATCH]
+
+
+def daily_strategy_window(today=None):
+    """统一日线策略窗口，供扫描调度和策略计算共用。"""
+    today = today or datetime.today()
+    history_start = today - timedelta(days=200)
+    return history_start.strftime('%Y%m%d'), today.strftime('%Y%m%d')
 
 def get_recent_days_data(daily_data, days=30, sort=False):
     """

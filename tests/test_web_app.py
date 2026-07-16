@@ -2,10 +2,11 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from common.StockEnum import StockStatus
 from market_data.database import MarketDataDatabase
-from tests.test_market_data import sample_etf_list, sample_stock_list
+from tests.test_market_data import sample_bars, sample_etf_list, sample_stock_list
 from web_app.app import create_app
 from web_app.tasks import TaskManager
 
@@ -23,7 +24,15 @@ class FakeTaskManager:
 
     @staticmethod
     def _state(name):
-        return {"name": name, "status": "idle", "started_at": None, "finished_at": None, "result": None, "error": None}
+        return {
+            "name": name,
+            "status": "idle",
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+            "run_id": None,
+        }
 
     def get_status(self):
         return self.tasks
@@ -32,8 +41,8 @@ class FakeTaskManager:
         self.tasks["refresh_stocks"]["status"] = "running"
         return True, self.tasks["refresh_stocks"]
 
-    def start_scan_market(self):
-        self.tasks["scan_market"]["status"] = "running"
+    def start_scan_market(self, scan_scope="all"):
+        self.tasks["scan_market"].update({"status": "running", "scan_scope": scan_scope})
         return True, self.tasks["scan_market"]
 
     def start_refresh_etfs(self):
@@ -41,8 +50,20 @@ class FakeTaskManager:
         return True, self.tasks["refresh_etfs"]
 
     def start_retry_errors(self, run_id):
-        self.tasks["retry_errors"].update({"status": "running", "run_id": run_id})
+        self.tasks["retry_errors"].update({"status": "running", "source_run_id": run_id})
         return True, self.tasks["retry_errors"]
+
+    def pause_task(self, name):
+        if self.tasks[name]["status"] != "running":
+            return False, self.tasks[name]
+        self.tasks[name]["status"] = "paused"
+        return True, self.tasks[name]
+
+    def resume_task(self, name):
+        if self.tasks[name]["status"] != "paused":
+            return False, self.tasks[name]
+        self.tasks[name]["status"] = "running"
+        return True, self.tasks[name]
 
 
 class WebAppTest(unittest.TestCase):
@@ -76,24 +97,75 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn("themeToggle", page)
         self.assertIn('id="signalTableTitle"', page)
+        self.assertIn('data-action="scan-current"', page)
+        self.assertIn('startTask("scan", state.signalAssetType)', script)
         self.assertNotIn("策略信号中心", page)
         self.assertNotIn("任务中心", page)
         self.assertIn('data-view-target="etfs"', page)
         self.assertIn('data-view-target="settings"', page)
+        self.assertIn('data-view-target="daily-custom"', page)
+        self.assertIn('data-view-target="daily-other"', page)
+        self.assertIn('data-view-target="minute-custom"', page)
+        self.assertIn('data-view-target="minute-other"', page)
+        self.assertIn('data-nav-collapse="daily"', page)
+        self.assertIn('data-nav-collapse="minute"', page)
+        self.assertEqual(2, page.count('aria-expanded="false"'))
+        self.assertEqual(2, page.count('class="nav-subitems" hidden'))
         self.assertIn('id="databaseSettingsForm"', page)
         self.assertIn('id="stockGroupTabs"', page)
         self.assertIn('id="etfGroupTabs"', page)
+        self.assertIn('id="view-minute-custom"', page)
+        self.assertIn("ETF分钟级自定义策略", page)
+        self.assertIn("日线策略", page)
+        self.assertIn("分钟级策略", page)
+        self.assertIn('id="indexTrendChart"', page)
+        self.assertIn("主要指数走势", page)
+        self.assertNotIn("把分散的指标", page)
         self.assertNotIn("ETF主数据", page)
         self.assertNotIn("股票主数据", page)
         self.assertEqual(2, page.count("danger-action is-placeholder"))
-        self.assertEqual(4, page.count('class="app-modal-backdrop"'))
+        self.assertEqual(5, page.count('class="app-modal-backdrop"'))
         self.assertIn('id="confirmModal"', page)
+        self.assertIn('id="dailyChartModal"', page)
+        self.assertIn('id="dailyPreviewPopover"', page)
+        self.assertEqual(2, page.count("data-signal-asset="))
+        self.assertIn("vendor/lightweight-charts/lightweight-charts.standalone.production.js", page)
+        self.assertIn("Charts by TradingView", page)
         self.assertIn("confirmAction", script)
+        self.assertIn('if (viewName === "signals") viewName = "daily-custom";', script)
+        self.assertIn("function toggleNavGroup", script)
+        self.assertIn("function syncStrategyNav", script)
         self.assertNotIn("window.confirm", script)
         self.assertIn("vendor/tabler/tabler.min.css", page)
         self.assertIn('data-bs-theme="dark"', page)
         self.assertEqual(6, page.count('class="table table-vcenter table-hover"'))
         self.assertNotIn('class="card panel filters-panel', page)
+        self.assertNotIn('class="panel filters-panel stock-filters"', page)
+        self.assertIn('class="strategy-filter-grid" id="indicatorFilters"', page)
+        self.assertIn('class="search-field signal-search-field"', page)
+        self.assertEqual(2, page.count('class="search-field table-head-search-field"'))
+        self.assertEqual(3, page.count('class="signal-table-toolbar'))
+        self.assertIn("strategy-filter-card", script)
+        self.assertIn("function renderProfessionalDailyChart", script)
+        self.assertIn("function renderDailyPreviewCandles", script)
+        self.assertIn("function drawIndexChart", script)
+        self.assertNotIn("library.AreaSeries", script)
+        self.assertGreaterEqual(script.count("library.CandlestickSeries"), 3)
+        self.assertIn('id="indexTrendChart"', page)
+        self.assertNotIn('<canvas id="indexTrendChart"', page)
+        self.assertIn('class="index-ma-legend"', page)
+        self.assertIn("indexMovingAverageOptions", script)
+        self.assertIn("movingAverageSeries(candles, 60)", script)
+        self.assertIn("subscribeVisibleLogicalRangeChange", script)
+        self.assertIn("function loadOlderIndexHistory", script)
+        self.assertIn("rightBarStaysOnScroll: true", script)
+        self.assertIn("const INDEX_WHEEL_ZOOM_STEP = 0.08;", script)
+        self.assertIn("const INDEX_WHEEL_GESTURE_DELAY = 90;", script)
+        self.assertIn("mouseWheel: false", script)
+        self.assertIn("function continueIndexHistoryLoading", script)
+        self.assertIn("function selectSignalAssetType", script)
+        self.assertIn('data-view-daily="${code}"', script)
+        self.assertRegex(stylesheet, re.compile(r"\.strategy-filter-grid\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit,", re.DOTALL))
         self.assertRegex(stylesheet, re.compile(r"\.filters-panel\s*\{[^}]*flex-direction:\s*row;", re.DOTALL))
         self.assertRegex(stylesheet, re.compile(r"\.modal-card\s*\{[^}]*z-index:\s*1;", re.DOTALL))
         self.assertRegex(stylesheet, re.compile(r"\.modal-shell\s*>\s*\.modal-backdrop\s*\{[^}]*z-index:\s*0;", re.DOTALL))
@@ -109,6 +181,57 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(2, payload["stats"]["stock_count"])
         self.assertEqual(2, payload["stats"]["etf_count"])
         self.assertEqual(1, payload["latest_scan"]["matched_stocks"])
+        self.assertEqual("D", payload["indices"]["period"])
+
+    def test_indices_endpoint_returns_major_market_trends(self):
+        bars = sample_bars()
+        bars.attrs["source"] = "eastmoney"
+
+        with patch("web_app.app.MarketDataService.daily_cache_ready", return_value=False), \
+                patch("web_app.app.MarketDataService.get_daily_data", return_value=bars):
+            payload = self.client.get("/api/indices?limit=2&refresh=1").get_json()
+
+        self.assertEqual("D", payload["period"])
+        self.assertEqual(
+            ["上证", "深成指", "创业板", "沪深300", "科创50", "恒生", "纳斯达克", "黄金现货"],
+            [item["short_name"] for item in payload["items"]],
+        )
+        self.assertEqual(2, len(payload["items"][0]["points"]))
+        self.assertEqual("eastmoney", payload["items"][0]["source"])
+        self.assertFalse(payload["items"][0]["needs_refresh"])
+
+    def test_dashboard_indices_are_loaded_from_sqlite_without_network_refresh(self):
+        self.database.save_klines("000001.SH", "D", sample_bars(), "seed", coverage_start="2026-07-01", coverage_end="2026-07-13")
+
+        with patch("web_app.app.MarketDataService.get_daily_data", side_effect=AssertionError("network should not run")):
+            payload = self.client.get("/api/dashboard").get_json()
+
+        first_index = payload["indices"]["items"][0]
+        self.assertEqual("上证", first_index["short_name"])
+        self.assertEqual("sqlite_cache", first_index["source"])
+        self.assertEqual(2, len(first_index["points"]))
+        self.assertTrue(first_index["needs_refresh"])
+
+    def test_index_history_endpoint_returns_cached_bars_before_cursor(self):
+        bars = sample_bars()
+        bars["trade_time"] = bars["trade_time"] - bars["trade_time"].min() + bars["trade_time"].min().replace(month=6, day=2)
+        self.database.save_klines("000001.SH", "D", bars, "seed", coverage_start="2026-06-01", coverage_end="2026-06-30")
+
+        response = self.client.get("/api/indices/000001.SH/history?before=2026-07-01&limit=2&ensure=0")
+        payload = response.get_json()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("000001.SH", payload["symbol"])
+        self.assertEqual(2, len(payload["items"]))
+        self.assertTrue(payload["has_more"])
+        self.assertTrue(all(item["trade_time"] < "2026-07-01" for item in payload["items"]))
+
+    def test_index_history_endpoint_rejects_unknown_symbol_and_invalid_date(self):
+        unknown = self.client.get("/api/indices/600000.SH/history?before=2026-07-01")
+        invalid = self.client.get("/api/indices/000001.SH/history?before=not-a-date")
+
+        self.assertEqual(404, unknown.status_code)
+        self.assertEqual(400, invalid.status_code)
 
     def test_stock_and_signal_search(self):
         stocks = self.client.get("/api/stocks?q=平安").get_json()
@@ -118,6 +241,21 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual("000001.SZ", stocks["items"][0]["ts_code"])
         self.assertEqual(1, signals["total"])
         self.assertEqual("平安银行", signals["items"][0]["stock_name"])
+
+    def test_signal_api_separates_stock_and_etf_results(self):
+        self.database.save_stock_signals(
+            self.run_id, "510300.SH", "沪深300ETF", [StockStatus.SUPPORT_LEVEL_REBOUND.value], asset_type="etf"
+        )
+
+        stocks = self.client.get("/api/signals?asset_type=stock").get_json()
+        etfs = self.client.get("/api/signals?asset_type=etf").get_json()
+
+        self.assertEqual(1, stocks["total"])
+        self.assertEqual("stock", stocks["items"][0]["asset_type"])
+        self.assertEqual(1, etfs["total"])
+        self.assertEqual("510300.SH", etfs["items"][0]["ts_code"])
+        indicator_counts = {item["label"]: item["count"] for item in etfs["indicators"]}
+        self.assertEqual(1, indicator_counts[StockStatus.SUPPORT_LEVEL_REBOUND.value])
 
     def test_etf_list_and_independent_group_workflow(self):
         create_response = self.client.post("/api/instrument-groups", json={"asset_type": "etf", "name": "ETF自选"})
@@ -153,6 +291,19 @@ class WebAppTest(unittest.TestCase):
 
         self.assertEqual(202, response.status_code)
         self.assertTrue(response.get_json()["started"])
+        self.assertEqual("all", response.get_json()["task"]["scan_scope"])
+
+    def test_strategy_tab_starts_scoped_scan_task(self):
+        response = self.client.post("/api/tasks/scan-market", json={"scan_scope": "etf"})
+
+        self.assertEqual(202, response.status_code)
+        self.assertEqual("etf", response.get_json()["task"]["scan_scope"])
+
+    def test_scan_task_rejects_unknown_scope(self):
+        response = self.client.post("/api/tasks/scan-market", json={"scan_scope": "fund"})
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("扫描范围", response.get_json()["error"])
 
     def test_task_progress_combines_live_task_and_scan_state(self):
         payload = self.client.get("/api/task-progress?limit=1").get_json()
@@ -189,6 +340,19 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(409, response.status_code)
         self.assertIn("运行中的任务不能删除", response.get_json()["error"])
         self.assertIsNotNone(self.database.get_scan_run(running_id))
+
+    def test_scan_task_can_be_paused_and_resumed(self):
+        running_id = self.database.start_scan_run(10)
+        self.task_manager.tasks["scan_market"].update({"status": "running", "run_id": running_id})
+
+        paused = self.client.post("/api/tasks/scan_market/pause", json={})
+        resumed = self.client.post("/api/tasks/scan_market/resume", json={})
+
+        self.assertEqual(200, paused.status_code)
+        self.assertEqual("paused", paused.get_json()["task"]["status"])
+        self.assertEqual(200, resumed.status_code)
+        self.assertEqual("running", resumed.get_json()["task"]["status"])
+        self.assertEqual("running", self.database.get_scan_run(running_id)["status"])
 
     def test_database_settings_can_copy_and_switch_to_cloud_directory(self):
         target_directory = Path(self.temp_dir.name) / "OneDrive" / "AStockData"
@@ -232,10 +396,40 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(202, retry_response.status_code)
         self.assertTrue(retry_response.get_json()["started"])
 
+    def test_running_scan_errors_can_be_viewed_and_retried(self):
+        running_id = self.database.start_scan_run(3)
+        self.database.save_scan_error(running_id, "000001.SZ", "平安银行", "TimeoutError", "行情接口超时")
+        self.database.update_scan_run(running_id, 1, 0, 1)
+        self.task_manager.tasks["scan_market"]["status"] = "running"
+
+        detail = self.client.get(f"/api/scan-runs/{running_id}/errors").get_json()
+        retry_response = self.client.post(f"/api/scan-runs/{running_id}/retry-errors", json={})
+
+        self.assertEqual(1, detail["summary"]["unresolved"])
+        self.assertTrue(detail["can_retry"])
+        self.assertEqual(202, retry_response.status_code)
+        self.assertEqual("running", retry_response.get_json()["task"]["status"])
+
     def test_invalid_kline_period_returns_validation_error(self):
         response = self.client.get("/api/klines/000001.SZ?period=1min")
 
         self.assertEqual(400, response.status_code)
+
+    def test_daily_chart_endpoint_fetches_and_returns_ohlcv(self):
+        bars = sample_bars()
+        bars.attrs["source"] = "eastmoney"
+
+        with patch("web_app.app.MarketDataService.get_daily_data", return_value=bars) as fetch:
+            response = self.client.get("/api/klines/000001.SZ?period=D&months=3&limit=90&ensure=1")
+
+        payload = response.get_json()
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("eastmoney", payload["source"])
+        self.assertTrue(payload["has_volume"])
+        self.assertTrue(payload["has_ohlcv"])
+        self.assertEqual(2, len(payload["items"]))
+        self.assertEqual(1000, payload["items"][0]["vol"])
+        fetch.assert_called_once()
 
     def test_stock_refresh_is_blocked_while_market_scan_is_running(self):
         manager = TaskManager()
@@ -245,6 +439,15 @@ class WebAppTest(unittest.TestCase):
 
         self.assertFalse(started)
         self.assertEqual("scan_market", task["name"])
+
+    def test_frontend_task_polling_is_visibility_gated(self):
+        script = Path(__file__).resolve().parents[1].joinpath("web_app/static/js/app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function shouldPollTasks", script)
+        self.assertIn('state.currentView === "runs"', script)
+        self.assertIn('if (state.currentView === "runs") renderRunRows', script)
+        self.assertIn("scheduleTaskPoll(1000, true)", script)
+        self.assertIn('if (taskName === "scan" && data.started) showView("runs")', script)
 
 
 if __name__ == "__main__":

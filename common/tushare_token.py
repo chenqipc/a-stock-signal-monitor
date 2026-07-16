@@ -1,2 +1,0 @@
-tushare_token = """3dff82d6aefa972a143ab6eea61840e48c4f00e54574b1b02a536186"""
-# tushare_token = """8f61b794e37d65325f31bbd7cd4bc4055996e79f30a6470308757166"""

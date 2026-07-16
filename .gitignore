@@ -170,15 +170,17 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# 提交可复用的行情快照，继续忽略其他本地数据库和SQLite运行时文件
+# 行情数据库仅保存在本机或用户配置的同步目录，避免大文件进入Git历史。
 *.db
-!resource/market_data.db
 *.db-shm
 *.db-wal
 *.db-journal
 *.db.copying*
 # 每台设备的数据库目录不同，不提交本机路径设置。
 resource/app_settings.json*
+# 行情账号密钥仅保存在本机；示例文件可以提交。
+resource/local_secrets.json
+!resource/local_secrets.example.json
 双底结构.txt
 底部支撑反弹10日线.txt
 最近3天MACD金叉.txt

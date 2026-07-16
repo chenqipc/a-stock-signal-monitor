@@ -127,6 +127,7 @@ class MarketDataDatabase:
                 CREATE TABLE IF NOT EXISTS scan_run (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_type TEXT NOT NULL DEFAULT 'market_scan',
+                    scan_scope TEXT NOT NULL DEFAULT 'all',
                     parent_run_id INTEGER,
                     started_at TEXT NOT NULL,
                     completed_at TEXT,
@@ -141,6 +142,7 @@ class MarketDataDatabase:
                     run_id INTEGER NOT NULL,
                     ts_code TEXT NOT NULL,
                     stock_name TEXT NOT NULL,
+                    asset_type TEXT NOT NULL DEFAULT 'stock',
                     signal_type TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (run_id, ts_code, signal_type),
@@ -152,6 +154,7 @@ class MarketDataDatabase:
                     run_id INTEGER NOT NULL,
                     ts_code TEXT NOT NULL,
                     stock_name TEXT NOT NULL,
+                    asset_type TEXT NOT NULL DEFAULT 'stock',
                     status TEXT NOT NULL DEFAULT 'failed',
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     first_error_type TEXT NOT NULL,
@@ -170,8 +173,12 @@ class MarketDataDatabase:
             self._ensure_column(connection, "fetch_state", "coverage_start", "TEXT")
             self._ensure_column(connection, "fetch_state", "coverage_end", "TEXT")
             self._ensure_column(connection, "scan_run", "task_type", "TEXT NOT NULL DEFAULT 'market_scan'")
+            self._ensure_column(connection, "scan_run", "scan_scope", "TEXT NOT NULL DEFAULT 'all'")
             self._ensure_column(connection, "scan_run", "parent_run_id", "INTEGER")
+            self._ensure_column(connection, "stock_signal", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
+            self._ensure_column(connection, "scan_error", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_run_task_type ON scan_run(task_type, id DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_stock_signal_asset ON stock_signal(run_id, asset_type, signal_type)")
 
     def backup_to(self, target_path):
         """使用SQLite在线备份API生成一致快照，包含尚未checkpoint的WAL数据。"""
@@ -475,6 +482,12 @@ class MarketDataDatabase:
         except KeyError as exc:
             raise ValueError("资产类型必须是 stock 或 etf") from exc
 
+    @classmethod
+    def _normalize_asset_type(cls, asset_type):
+        normalized = str(asset_type or "stock").strip().lower()
+        cls._asset_table(normalized)
+        return normalized
+
     def list_instrument_groups(self, asset_type):
         """返回指定资产类型的自定义分组及条目、置顶数量。"""
         self._asset_table(asset_type)
@@ -565,24 +578,35 @@ class MarketDataDatabase:
             raise ValueError("分组不存在或资产类型不匹配")
         return row
 
-    def start_scan_run(self, total_stocks):
-        return self.start_task_run(TASK_TYPE_MARKET_SCAN, total_stocks)
+    def start_scan_run(self, total_stocks, scan_scope="all"):
+        return self.start_task_run(TASK_TYPE_MARKET_SCAN, total_stocks, scan_scope=scan_scope)
 
     def start_retry_run(self, source_run_id, total_stocks):
         """为错误重试创建独立任务，并保留与原扫描任务的关联。"""
-        return self.start_task_run(TASK_TYPE_ERROR_RETRY, total_stocks, parent_run_id=source_run_id)
+        source_run = self.get_scan_run(source_run_id) or {}
+        return self.start_task_run(
+            TASK_TYPE_ERROR_RETRY, total_stocks, parent_run_id=source_run_id, scan_scope=source_run.get("scan_scope", "all")
+        )
 
-    def start_task_run(self, task_type, total_stocks, parent_run_id=None):
+    def start_task_run(self, task_type, total_stocks, parent_run_id=None, scan_scope="all"):
         started_at = self._utc_now()
+        normalized_scope = self._normalize_scan_scope(scan_scope)
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO scan_run(task_type, parent_run_id, started_at, status, total_stocks)
-                VALUES (?, ?, ?, 'running', ?)
+                INSERT INTO scan_run(task_type, scan_scope, parent_run_id, started_at, status, total_stocks)
+                VALUES (?, ?, ?, ?, 'running', ?)
                 """,
-                (task_type, parent_run_id, started_at, int(total_stocks)),
+                (task_type, normalized_scope, parent_run_id, started_at, int(total_stocks)),
             )
             return cursor.lastrowid
+
+    @staticmethod
+    def _normalize_scan_scope(scan_scope):
+        value = str(scan_scope or "all").strip().lower()
+        if value not in {"all", "stock", "etf"}:
+            raise ValueError(f"不支持的扫描范围: {scan_scope}")
+        return value
 
     def update_scan_run(self, run_id, processed_stocks, matched_stocks, error_count):
         with self._connect() as connection:
@@ -593,6 +617,10 @@ class MarketDataDatabase:
                 """,
                 (processed_stocks, matched_stocks, error_count, run_id),
             )
+
+    def update_scan_run_status(self, run_id, status):
+        with self._connect() as connection:
+            connection.execute("UPDATE scan_run SET status = ? WHERE id = ?", (status, int(run_id)))
 
     def finish_scan_run(self, run_id, status, processed_stocks, matched_stocks, error_count, error_message=None):
         with self._connect() as connection:
@@ -610,39 +638,42 @@ class MarketDataDatabase:
             cursor = connection.execute(
                 """
                 UPDATE scan_run SET completed_at = ?, status = 'failed', error_message = ?
-                WHERE status = 'running'
+                WHERE status IN ('running', 'paused')
                 """,
                 (self._utc_now(), error_message),
             )
         return cursor.rowcount
 
-    def save_stock_signals(self, run_id, ts_code, stock_name, signal_types):
+    def save_stock_signals(self, run_id, ts_code, stock_name, signal_types, asset_type="stock"):
         created_at = self._utc_now()
-        rows = [(run_id, ts_code, stock_name, signal_type, created_at) for signal_type in signal_types]
+        normalized_asset_type = self._normalize_asset_type(asset_type)
+        rows = [(run_id, ts_code, stock_name, normalized_asset_type, signal_type, created_at) for signal_type in signal_types]
         if not rows:
             return
         with self._connect() as connection:
             connection.executemany(
                 """
-                INSERT OR IGNORE INTO stock_signal(run_id, ts_code, stock_name, signal_type, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO stock_signal(run_id, ts_code, stock_name, asset_type, signal_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
 
-    def save_scan_error(self, run_id, ts_code, stock_name, error_type, error_message, increment_retry=False):
-        """记录逐股票扫描错误；重试再次失败时保留首次原因并更新最近原因。"""
+    def save_scan_error(self, run_id, ts_code, stock_name, error_type, error_message, increment_retry=False, asset_type="stock"):
+        """记录逐标的扫描错误；重试再次失败时保留首次原因并更新最近原因。"""
         now = self._utc_now()
         retry_increment = 1 if increment_retry else 0
+        normalized_asset_type = self._normalize_asset_type(asset_type)
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO scan_error(
-                    run_id, ts_code, stock_name, status, retry_count, first_error_type, first_error_message,
+                    run_id, ts_code, stock_name, asset_type, status, retry_count, first_error_type, first_error_message,
                     last_error_type, last_error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, ts_code) DO UPDATE SET
                     stock_name = excluded.stock_name,
+                    asset_type = excluded.asset_type,
                     status = 'failed',
                     retry_count = scan_error.retry_count + excluded.retry_count,
                     last_error_type = excluded.last_error_type,
@@ -653,6 +684,7 @@ class MarketDataDatabase:
                     run_id,
                     ts_code,
                     stock_name,
+                    normalized_asset_type,
                     retry_increment,
                     error_type,
                     error_message,
@@ -684,7 +716,7 @@ class MarketDataDatabase:
             row = connection.execute("SELECT status FROM scan_run WHERE id = ?", (int(run_id),)).fetchone()
             if not row:
                 return "not_found"
-            if row["status"] == "running":
+            if row["status"] in {"running", "paused"}:
                 return "running"
             # 重试任务可以独立保留，但原扫描删除后不应继续引用不存在的来源任务。
             connection.execute("UPDATE scan_run SET parent_run_id = NULL WHERE parent_run_id = ?", (int(run_id),))
@@ -698,7 +730,7 @@ class MarketDataDatabase:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT id, run_id, ts_code, stock_name, status, retry_count, first_error_type,
+                SELECT id, run_id, ts_code, stock_name, asset_type, status, retry_count, first_error_type,
                        first_error_message, last_error_type, last_error_message, created_at, updated_at
                 FROM scan_error WHERE run_id = ? {condition}
                 ORDER BY CASE status WHEN 'failed' THEN 0 ELSE 1 END, updated_at DESC
@@ -780,22 +812,27 @@ class MarketDataDatabase:
         """兼容旧调用方；页面展示已升级为包含扫描和重试的任务队列。"""
         return self.get_task_history(limit)
 
-    def get_signal_summary(self, run_id=None):
-        run_id = run_id or self._latest_completed_run_id()
+    def get_signal_summary(self, run_id=None, asset_type=""):
+        run_id = run_id or self._latest_completed_run_id(asset_type)
         if not run_id:
             return []
+        conditions = ["run_id = ?"]
+        params = [run_id]
+        if asset_type:
+            conditions.append("asset_type = ?")
+            params.append(self._normalize_asset_type(asset_type))
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT signal_type, COUNT(*) AS count
-                FROM stock_signal WHERE run_id = ? GROUP BY signal_type ORDER BY count DESC, signal_type
+                FROM stock_signal WHERE {' AND '.join(conditions)} GROUP BY signal_type ORDER BY count DESC, signal_type
                 """,
-                (run_id,),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_latest_signals(self, limit=100, signal_type="", query=""):
-        run_id = self._latest_completed_run_id()
+    def get_latest_signals(self, limit=100, signal_type="", query="", asset_type=""):
+        run_id = self._latest_completed_run_id(asset_type)
         if not run_id:
             return []
         conditions = ["run_id = ?"]
@@ -803,6 +840,9 @@ class MarketDataDatabase:
         if signal_type:
             conditions.append("signal_type = ?")
             params.append(signal_type)
+        if asset_type:
+            conditions.append("asset_type = ?")
+            params.append(self._normalize_asset_type(asset_type))
         if query:
             conditions.append("(ts_code LIKE ? OR stock_name LIKE ?)")
             keyword = f"%{query}%"
@@ -811,7 +851,7 @@ class MarketDataDatabase:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT run_id, ts_code, stock_name, signal_type, created_at
+                SELECT run_id, ts_code, stock_name, asset_type, signal_type, created_at
                 FROM stock_signal WHERE {' AND '.join(conditions)}
                 ORDER BY signal_type, ts_code LIMIT ?
                 """,
@@ -819,15 +859,16 @@ class MarketDataDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def _latest_completed_run_id(self):
+    def _latest_completed_run_id(self, asset_type=""):
+        conditions = ["status = 'completed'", "task_type = ?"]
+        params = [TASK_TYPE_MARKET_SCAN]
+        if asset_type:
+            conditions.append("scan_scope IN (?, 'all')")
+            params.append(self._normalize_asset_type(asset_type))
         with self._connect() as connection:
             row = connection.execute(
-                """
-                SELECT id FROM scan_run
-                WHERE status = 'completed' AND task_type = ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (TASK_TYPE_MARKET_SCAN,),
+                f"SELECT id FROM scan_run WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT 1",
+                params,
             ).fetchone()
         return row[0] if row else None
 

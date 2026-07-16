@@ -53,7 +53,11 @@ class EastMoneyProvider:
         parts = symbol.split(".")
         code = parts[0]
         if len(parts) > 1:
-            market_id = "1" if parts[1].upper() == "SH" else "0"
+            suffix = parts[1].upper()
+            if suffix == "HK":
+                market_id = "100"
+            else:
+                market_id = "1" if suffix == "SH" else "0"
         else:
             market_id = "1" if code.startswith(("5", "6", "9")) else "0"
         return code, market_id
@@ -65,6 +69,8 @@ class EastMoneyProvider:
     def fetch_bars(self, symbol, period, start_date, end_date):
         if period not in self.supported_periods:
             raise ProviderUnavailableError(f"东方财富不支持周期: {period}")
+        if not self.supports_symbol(symbol):
+            raise ProviderUnavailableError(f"东方财富不支持证券市场: {symbol}")
         if period == "120min":
             return self._merge_60min_to_120min(self.fetch_bars(symbol, "60min", start_date, end_date))
         code, market_id = self.normalize_symbol(symbol)
@@ -75,6 +81,11 @@ class EastMoneyProvider:
         if data.empty:
             raise ProviderUnavailableError(f"东方财富未返回 {symbol} {period} 数据")
         return data
+
+    @staticmethod
+    def supports_symbol(symbol):
+        normalized = str(symbol).strip().upper()
+        return normalized.startswith(("SH.", "SZ.", "BJ.")) or normalized.endswith((".SH", ".SZ", ".BJ", ".HK"))
 
     def get_daily_data(self, symbol, start_date=None, end_date=None):
         return self.fetch_bars(symbol, "D", start_date or "20200101", end_date or "20500101")

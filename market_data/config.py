@@ -11,15 +11,46 @@ RESOURCE_DIR = PROJECT_ROOT / "resource"
 DEFAULT_DATABASE_DIRECTORY = RESOURCE_DIR
 DATABASE_FILENAME = "market_data.db"
 APP_SETTINGS_PATH = RESOURCE_DIR / "app_settings.json"
+LOCAL_SECRETS_PATH = RESOURCE_DIR / "local_secrets.json"
 _SETTINGS_LOCK = RLock()
 ENABLE_TUSHARE_FALLBACK = os.getenv("ENABLE_TUSHARE_FALLBACK", "0") == "1"
+TUSHARE_REQUESTS_PER_MINUTE = max(1, int(os.getenv("TUSHARE_REQUESTS_PER_MINUTE", "45")))
+TUSHARE_DAILY_REQUEST_LIMIT = max(1, int(os.getenv("TUSHARE_DAILY_REQUEST_LIMIT", "7500")))
 HTTP_TIMEOUT_SECONDS = float(os.getenv("MARKET_DATA_HTTP_TIMEOUT", "10"))
 PROVIDER_MAX_RETRIES = int(os.getenv("MARKET_DATA_MAX_RETRIES", "2"))
+PROVIDER_RETRY_MAX_DELAY_SECONDS = int(os.getenv("MARKET_DATA_RETRY_MAX_DELAY_SECONDS", "60"))
 ALLOW_INSECURE_HTTP_FALLBACK = os.getenv("ALLOW_INSECURE_HTTP_FALLBACK", "0") == "1"
 DAILY_CACHE_OVERLAP_BARS = max(2, int(os.getenv("DAILY_CACHE_OVERLAP_BARS", "2")))
 MINUTE_CACHE_TTL_SECONDS = int(os.getenv("MINUTE_CACHE_TTL_SECONDS", "60"))
 MIN_STOCK_LIST_SIZE = int(os.getenv("MIN_STOCK_LIST_SIZE", "1000"))
 MIN_ETF_LIST_SIZE = int(os.getenv("MIN_ETF_LIST_SIZE", "100"))
+SCAN_CACHED_WORKERS = max(1, int(os.getenv("SCAN_CACHED_WORKERS", "6")))
+
+
+def get_tushare_tokens(secrets_path=None):
+    """从环境变量或本机私密文件读取Token，绝不使用可提交的Python源码保存密钥。"""
+    environment_value = os.getenv("TUSHARE_TOKENS") or os.getenv("TUSHARE_TOKEN")
+    if environment_value:
+        return _normalize_tokens(environment_value)
+    path = Path(secrets_path or LOCAL_SECRETS_PATH)
+    if not path.exists():
+        return []
+    with _SETTINGS_LOCK:
+        try:
+            content = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"本机私密配置无法读取: {path}") from exc
+    values = content.get("tushare_tokens", []) if isinstance(content, dict) else []
+    return _normalize_tokens(values)
+
+
+def _normalize_tokens(values):
+    if isinstance(values, str):
+        values = values.replace(";", ",").replace("\n", ",").split(",")
+    if not isinstance(values, (list, tuple)):
+        return []
+    # 去重时保持配置顺序，便于Token轮换行为稳定且可预测。
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
 def get_database_configuration(settings_path=None):

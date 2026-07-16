@@ -35,10 +35,11 @@ uv run a-stock-web
 
 ## 数据源降级顺序
 
-- 日线：BaoStock → 东方财富 → SQLite历史缓存。
+- A股日线：BaoStock → 新浪 → 腾讯财经 → 东方财富 → Tushare（配置Token后）→ SQLite历史缓存。
+- 海外指数与黄金：Yahoo Finance / 上海黄金交易所专用源 → 其他兼容源 → SQLite历史缓存。
 - 分钟线：BaoStock → 东方财富 → 新浪 → SQLite历史缓存；过旧K线会继续触发下一个渠道。
 - ETF列表：BaoStock → 东方财富 → SQLite最近快照。
-- Tushare：非核心可选扩展，仅在安装可选依赖并设置 `ENABLE_TUSHARE_FALLBACK=1` 时作为日线最后网络兜底。
+- Tushare：仅调用120积分可用的未复权股票日线，两个Token默认共用45次/分钟、7500次/日的保守额度。
 
 所有网络源均失败但本地存在历史记录时，服务返回最近缓存并将来源标记为 `sqlite_stale_cache`。
 
@@ -62,7 +63,15 @@ uv run a-stock-web
 ```
 
 项目依赖由 `pyproject.toml` 和 `uv.lock` 统一管理，虚拟环境固定使用项目根目录下的 `.venv`。
-如需启用可选的Tushare兜底，可执行 `uv sync --extra tushare`。
+
+Tushare Token只能写入已被Git忽略的 `resource/local_secrets.json`，可复制
+`resource/local_secrets.example.json` 后填写；也可以使用环境变量，配置后会自动启用最后兜底：
+
+```bash
+export TUSHARE_TOKENS=第一个Token,第二个Token
+export TUSHARE_REQUESTS_PER_MINUTE=45
+export TUSHARE_DAILY_REQUEST_LIMIT=7500
+```
 
 可通过环境变量覆盖数据库位置、请求超时和重试次数：
 

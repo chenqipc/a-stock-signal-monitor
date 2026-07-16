@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="A股全市场策略筛选与ETF分钟信号监控控制台">
     <title>A-Stock Signal Monitor</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
     <script>
         const savedTheme = localStorage.getItem("asm-theme");
         const initialTheme = savedTheme || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
@@ -27,9 +28,27 @@
                 <button class="nav-item active" data-view-target="overview" type="button">
                     <span class="nav-icon">⌂</span><span>监控总览</span>
                 </button>
-                <button class="nav-item" data-view-target="signals" type="button">
-                    <span class="nav-icon">◇</span><span>策略信号</span>
-                </button>
+                <div class="nav-section">
+                    <div class="nav-section-title"><span class="nav-icon">◇</span><span>策略信号</span></div>
+                    <div class="nav-subgroup" data-nav-group="daily">
+                        <button class="nav-subgroup-toggle" data-nav-collapse="daily" type="button" aria-expanded="false">
+                            <span>日线策略</span><i aria-hidden="true">›</i>
+                        </button>
+                        <div class="nav-subitems" hidden>
+                            <button class="nav-item nav-child" data-view-target="daily-custom" type="button">自定义策略</button>
+                            <button class="nav-item nav-child" data-view-target="daily-other" type="button">其他策略</button>
+                        </div>
+                    </div>
+                    <div class="nav-subgroup" data-nav-group="minute">
+                        <button class="nav-subgroup-toggle" data-nav-collapse="minute" type="button" aria-expanded="false">
+                            <span>分钟级策略</span><i aria-hidden="true">›</i>
+                        </button>
+                        <div class="nav-subitems" hidden>
+                            <button class="nav-item nav-child" data-view-target="minute-custom" type="button">自定义策略</button>
+                            <button class="nav-item nav-child" data-view-target="minute-other" type="button">其他策略</button>
+                        </div>
+                    </div>
+                </div>
                 <button class="nav-item" data-view-target="stocks" type="button">
                     <span class="nav-icon">⌕</span><span>股票列表</span>
                 </button>
@@ -66,27 +85,29 @@
             </header>
 
             <section class="view active" id="view-overview" data-view="overview">
-                <article class="hero-card">
-                    <div class="hero-glow"></div>
-                    <div class="hero-copy">
-                        <div class="market-badge"><i id="marketDot"></i><span id="marketLabel">读取交易状态</span></div>
-                        <p class="hero-kicker">A股策略雷达</p>
-                        <h2>把分散的指标，变成<br><span>清晰可执行的股票线索。</span></h2>
-                        <p class="hero-description">统一扫描全市场策略信号，追踪ETF均线状态，并自动记录每次筛选结果。</p>
+                <article class="card panel index-panel">
+                    <div class="index-panel-head">
+                        <div>
+                            <div class="market-badge"><i id="marketDot"></i><span id="marketLabel">读取交易状态</span></div>
+                            <p class="panel-kicker">MARKET INDEX</p><h2>主要指数走势</h2>
+                        </div>
                         <div class="hero-actions">
                             <button class="btn primary-button" id="startScanButton" type="button">开始全市场扫描 <span>→</span></button>
                             <button class="btn secondary-button" id="refreshStocksButton" type="button">刷新股票列表</button>
                         </div>
                     </div>
-                    <div class="radar-panel" aria-hidden="true">
-                        <div class="radar-ring ring-one"></div>
-                        <div class="radar-ring ring-two"></div>
-                        <div class="radar-ring ring-three"></div>
-                        <div class="radar-sweep"></div>
-                        <div class="radar-point point-one"></div>
-                        <div class="radar-point point-two"></div>
-                        <div class="radar-point point-three"></div>
-                        <div class="radar-core"><strong id="heroSignalCount">0</strong><span>策略命中</span></div>
+                    <div class="index-layout">
+                        <div class="index-tabs" id="indexTabs"><div class="empty-state">正在加载指数…</div></div>
+                        <div class="index-chart-box">
+                            <div class="chart-caption">
+                                <strong id="indexChartTitle">选择指数查看走势</strong><span id="indexChartMeta">日线 · 本地优先</span>
+                            </div>
+                            <div class="index-ma-legend" aria-label="指数均线图例">
+                                <span class="ma5">MA5</span><span class="ma10">MA10</span>
+                                <span class="ma20">MA20</span><span class="ma60">MA60</span>
+                            </div>
+                            <div id="indexTrendChart" aria-label="主要指数走势图"></div>
+                        </div>
                     </div>
                 </article>
 
@@ -101,34 +122,20 @@
                     <article class="card panel signal-panel">
                         <div class="panel-head">
                             <div><p class="panel-kicker">SIGNAL MATRIX</p><h3>策略指标分布</h3></div>
-                            <button class="btn text-button" data-view-link="signals" type="button">查看全部 →</button>
+                            <button class="btn text-button" data-view-link="daily-custom" type="button">查看全部 →</button>
                         </div>
                         <p class="panel-description">指标由策略枚举动态生成，新增策略无需修改页面结构。</p>
                         <div class="indicator-grid" id="indicatorGrid"><div class="empty-state">正在加载指标…</div></div>
                     </article>
 
-                    <article class="card panel watch-panel">
-                        <div class="panel-head">
-                            <div><p class="panel-kicker">ETF WATCHLIST</p><h3>ETF监控池</h3></div>
-                            <span class="live-pill">分钟线</span>
-                        </div>
-                        <div class="watch-layout">
-                            <div class="watchlist" id="watchlist"><div class="empty-state">正在加载ETF…</div></div>
-                            <div class="chart-box">
-                                <div class="chart-caption"><strong id="chartTitle">选择ETF查看走势</strong><span id="chartMeta">本地缓存K线</span></div>
-                                <canvas id="priceChart" width="720" height="260" aria-label="ETF价格走势图"></canvas>
-                            </div>
-                        </div>
-                    </article>
-
                     <article class="card panel latest-panel">
                         <div class="panel-head">
-                            <div><p class="panel-kicker">LATEST MATCHES</p><h3>最新命中股票</h3></div>
-                            <button class="btn text-button" data-view-link="signals" type="button">筛选信号 →</button>
+                            <div><p class="panel-kicker">LATEST MATCHES</p><h3>最新命中标的</h3></div>
+                            <button class="btn text-button" data-view-link="daily-custom" type="button">筛选信号 →</button>
                         </div>
                         <div class="table-wrap">
                             <table class="table table-vcenter table-hover">
-                                <thead><tr><th>股票</th><th>策略指标</th><th>扫描任务</th></tr></thead>
+                                <thead><tr><th>标的</th><th>策略指标</th><th>扫描任务</th></tr></thead>
                                 <tbody id="latestSignalRows"><tr><td colspan="3" class="table-empty">等待扫描结果</td></tr></tbody>
                             </table>
                         </div>
@@ -144,24 +151,69 @@
                 </div>
             </section>
 
-            <section class="view" id="view-signals" data-view="signals">
-                <article class="panel filters-panel">
-                    <label class="search-field"><span>⌕</span>
-                        <input class="form-control" id="signalSearch" type="search" placeholder="搜索股票代码或名称">
-                    </label>
-                    <div class="filter-chips" id="indicatorFilters"></div>
-                    <button class="btn primary-button compact" data-action="scan" type="button">重新扫描</button>
+            <section class="view" id="view-daily-custom" data-view="daily-custom">
+                <div class="signal-asset-tabs" role="tablist" aria-label="日线策略资产类型">
+                    <button class="signal-asset-tab active" data-signal-asset="stock" role="tab" aria-selected="true" type="button">
+                        <span>股票</span><small>STOCKS</small>
+                    </button>
+                    <button class="signal-asset-tab" data-signal-asset="etf" role="tab" aria-selected="false" type="button">
+                        <span>ETF</span><small>FUNDS</small>
+                    </button>
+                </div>
+                <article class="card panel strategy-selector-panel">
+                    <div class="panel-head strategy-selector-head">
+                        <div><p class="panel-kicker">STRATEGY SELECTOR</p><h3>选择策略指标</h3></div>
+                        <span class="strategy-selector-hint">全部展开 · 点击即可筛选</span>
+                    </div>
+                    <div class="strategy-filter-grid" id="indicatorFilters"><div class="empty-state">正在加载策略指标…</div></div>
                 </article>
-                <article class="card panel">
-                    <div class="panel-head">
-                        <div><p class="panel-kicker">MATCHED STOCKS</p><h3 id="signalTableTitle">全部指标</h3></div>
-                        <span id="signalResultCount">0 条</span>
+                <article class="card panel signal-results-panel">
+                    <div class="panel-head signal-results-head">
+                        <div><p class="panel-kicker">MATCHED INSTRUMENTS</p><h3 id="signalTableTitle">全部指标</h3></div>
+                        <div class="signal-table-toolbar">
+                            <label class="search-field signal-search-field"><span>⌕</span>
+                                <input class="form-control" id="signalSearch" type="search" placeholder="搜索证券代码或名称">
+                            </label>
+                            <span class="signal-result-count" id="signalResultCount">0 条</span>
+                            <button class="btn primary-button compact" data-action="scan-current" type="button">重新扫描当前TAB</button>
+                        </div>
                     </div>
                     <div class="table-wrap large-table">
                         <table class="table table-vcenter table-hover">
-                            <thead><tr><th>股票代码</th><th>股票名称</th><th>命中指标</th><th>记录时间</th></tr></thead>
-                        <tbody id="signalRows"><tr><td colspan="4" class="table-empty">暂无信号数据</td></tr></tbody></table>
+                            <thead><tr><th>证券代码</th><th>名称</th><th>命中指标</th><th>记录时间</th><th>操作</th></tr></thead>
+                        <tbody id="signalRows"><tr><td colspan="5" class="table-empty">暂无信号数据</td></tr></tbody></table>
                     </div>
+                </article>
+            </section>
+
+            <section class="view" id="view-daily-other" data-view="daily-other">
+                <article class="card panel placeholder-panel">
+                    <p class="panel-kicker">DAILY STRATEGIES</p><h3>日线其他策略</h3>
+                    <p class="panel-description">这里预留给非自定义来源的日线策略，当前暂无启用策略。</p>
+                </article>
+            </section>
+
+            <section class="view" id="view-minute-custom" data-view="minute-custom">
+                <article class="card panel watch-panel strategy-watch-panel">
+                    <div class="panel-head">
+                        <div><p class="panel-kicker">MINUTE STRATEGIES</p><h3>ETF分钟级自定义策略</h3></div>
+                        <span class="live-pill">分钟线</span>
+                    </div>
+                    <p class="panel-description">当前分钟级策略来自持续扫描的ETF监控池，后续可从ETF列表选择标的加入监控。</p>
+                    <div class="watch-layout">
+                        <div class="watchlist" id="watchlist"><div class="empty-state">正在加载ETF…</div></div>
+                        <div class="chart-box">
+                            <div class="chart-caption"><strong id="chartTitle">选择ETF查看走势</strong><span id="chartMeta">本地缓存K线</span></div>
+                            <canvas id="priceChart" width="720" height="260" aria-label="ETF价格走势图"></canvas>
+                        </div>
+                    </div>
+                </article>
+            </section>
+
+            <section class="view" id="view-minute-other" data-view="minute-other">
+                <article class="card panel placeholder-panel">
+                    <p class="panel-kicker">MINUTE STRATEGIES</p><h3>分钟级其他策略</h3>
+                    <p class="panel-description">这里预留给非自定义来源的分钟级策略，当前暂无启用策略。</p>
                 </article>
             </section>
 
@@ -174,26 +226,26 @@
                         </button>
                     </div>
                     <div class="inline-actions">
-                        <button class="btn secondary-button compact" data-action="refresh-stocks" type="button">更新股票库</button>
                         <button class="btn text-button danger-action is-placeholder" id="deleteStockGroup" type="button"
                                 aria-hidden="true" disabled>删除当前分组</button>
                     </div>
                 </div>
-                <article class="panel filters-panel stock-filters">
-                    <label class="search-field"><span>⌕</span>
-                        <input class="form-control" id="stockSearch" type="search" placeholder="输入代码或股票名称">
-                    </label>
-                    <label class="select-field">
-                        <span>市场</span>
-                        <select class="form-select" id="marketFilter">
-                            <option value="">全部市场</option><option>上海</option><option>深圳</option><option>北京</option>
-                        </select>
-                    </label>
-                </article>
                 <article class="card panel">
-                    <div class="panel-head">
+                    <div class="panel-head signal-results-head master-table-head">
                         <div><p class="panel-kicker">STOCK MASTER</p><h3 id="stockTableTitle">全部股票</h3></div>
-                        <span id="stockResultCount">0 只</span>
+                        <div class="signal-table-toolbar master-table-toolbar">
+                            <label class="search-field table-head-search-field"><span>⌕</span>
+                                <input class="form-control" id="stockSearch" type="search" placeholder="输入代码或股票名称">
+                            </label>
+                            <label class="select-field table-head-market-field">
+                                <span>市场</span>
+                                <select class="form-select" id="marketFilter">
+                                    <option value="">全部市场</option><option>上海</option><option>深圳</option><option>北京</option>
+                                </select>
+                            </label>
+                            <span class="signal-result-count" id="stockResultCount">0 只</span>
+                            <button class="btn secondary-button compact" data-action="refresh-stocks" type="button">更新股票库</button>
+                        </div>
                     </div>
                     <div class="table-wrap large-table">
                         <table class="table table-vcenter table-hover">
@@ -217,26 +269,26 @@
                         </button>
                     </div>
                     <div class="inline-actions">
-                        <button class="btn secondary-button compact" data-action="refresh-etfs" type="button">更新ETF库</button>
                         <button class="btn text-button danger-action is-placeholder" id="deleteEtfGroup" type="button"
                                 aria-hidden="true" disabled>删除当前分组</button>
                     </div>
                 </div>
-                <article class="panel filters-panel stock-filters">
-                    <label class="search-field">
-                        <span>⌕</span><input class="form-control" id="etfSearch" type="search" placeholder="输入ETF代码或名称">
-                    </label>
-                    <label class="select-field">
-                        <span>市场</span>
-                        <select class="form-select" id="etfMarketFilter">
-                            <option value="">全部市场</option><option>上海</option><option>深圳</option>
-                        </select>
-                    </label>
-                </article>
                 <article class="card panel">
-                    <div class="panel-head">
+                    <div class="panel-head signal-results-head master-table-head">
                         <div><p class="panel-kicker">ETF MASTER</p><h3 id="etfTableTitle">全部ETF</h3></div>
-                        <span id="etfResultCount">0 只</span>
+                        <div class="signal-table-toolbar master-table-toolbar">
+                            <label class="search-field table-head-search-field">
+                                <span>⌕</span><input class="form-control" id="etfSearch" type="search" placeholder="输入ETF代码或名称">
+                            </label>
+                            <label class="select-field table-head-market-field">
+                                <span>市场</span>
+                                <select class="form-select" id="etfMarketFilter">
+                                    <option value="">全部市场</option><option>上海</option><option>深圳</option>
+                                </select>
+                            </label>
+                            <span class="signal-result-count" id="etfResultCount">0 只</span>
+                            <button class="btn secondary-button compact" data-action="refresh-etfs" type="button">更新ETF库</button>
+                        </div>
                     </div>
                     <div class="table-wrap large-table">
                         <table class="table table-vcenter table-hover">
@@ -323,6 +375,46 @@
         </main>
     </div>
 
+    <aside class="daily-preview-popover" id="dailyPreviewPopover" hidden aria-live="polite">
+        <header><div><strong id="dailyPreviewName">日线预览</strong><span id="dailyPreviewSymbol"></span></div><small>近3个月</small></header>
+        <div class="daily-preview-chart" id="dailyPreviewChart" aria-label="近3个月蜡烛图预览"></div>
+        <footer><span id="dailyPreviewMeta">正在读取本地缓存…</span><strong id="dailyPreviewChange">—</strong></footer>
+    </aside>
+
+    <div class="modal-shell" id="dailyChartModal" hidden>
+        <button class="app-modal-backdrop" data-daily-chart-close type="button" aria-label="关闭日线详情"></button>
+        <section class="card modal-card daily-chart-modal-card" role="dialog" aria-modal="true" aria-labelledby="dailyChartTitle">
+            <header class="modal-head daily-chart-modal-head">
+                <div>
+                    <p class="panel-kicker">DAILY MARKET CHART</p>
+                    <h2 id="dailyChartTitle">日线行情</h2>
+                    <p id="dailyChartSubtitle">正在读取近一年日线数据…</p>
+                </div>
+                <button class="btn modal-close" data-daily-chart-close type="button" aria-label="关闭">×</button>
+            </header>
+            <div class="daily-chart-modal-body">
+                <div class="daily-chart-summary" id="dailyChartSummary">
+                    <div><span>最新收盘</span><strong>—</strong></div><div><span>涨跌幅</span><strong>—</strong></div>
+                    <div><span>区间最高</span><strong>—</strong></div><div><span>区间最低</span><strong>—</strong></div>
+                    <div><span>最新成交量</span><strong>—</strong></div><div><span>最新成交额</span><strong>—</strong></div>
+                </div>
+                <div class="daily-chart-legend">
+                    <span><i class="legend-candle"></i>日K</span><span><i class="legend-ma5"></i>MA5</span>
+                    <span><i class="legend-ma10"></i>MA10</span><span><i class="legend-volume"></i>成交量</span>
+                </div>
+                <div class="daily-chart-container" id="dailyChartContainer"><div class="chart-loading">正在加载日线与成交量…</div></div>
+                <div class="daily-chart-warning" id="dailyChartWarning" hidden></div>
+            </div>
+            <footer class="modal-actions daily-chart-footer">
+                <span id="dailyChartSource">数据优先读取 SQLite 缓存</span>
+                <div class="inline-actions">
+                    <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView</a>
+                    <button class="btn secondary-button" data-daily-chart-close type="button">关闭</button>
+                </div>
+            </footer>
+        </section>
+    </div>
+
     <div class="modal-shell" id="groupModal" hidden>
         <button class="app-modal-backdrop" data-group-modal-close type="button" aria-label="关闭新建分组"></button>
         <form class="card modal-card compact-modal-card" id="groupForm">
@@ -380,7 +472,7 @@
                 <div class="run-error-message" id="runErrorMessage" hidden></div>
                 <div class="table-wrap modal-table-wrap">
                     <table class="table table-vcenter table-hover">
-                        <thead><tr><th>股票</th><th>错误类型</th><th>最近错误原因</th><th>重试</th><th>状态</th></tr></thead>
+                        <thead><tr><th>标的</th><th>错误类型</th><th>最近错误原因</th><th>重试</th><th>状态</th></tr></thead>
                         <tbody id="errorRows"><tr><td colspan="5" class="table-empty">正在加载…</td></tr></tbody>
                     </table>
                 </div>
@@ -389,7 +481,7 @@
                 <span id="retryHint">仅重试尚未解决的股票，不会重复扫描全市场。</span>
                 <div class="inline-actions">
                     <button class="btn secondary-button" data-error-modal-close type="button">关闭</button>
-                    <button class="btn primary-button compact" id="retryErrorsButton" type="button">重试失败股票</button>
+                    <button class="btn primary-button compact" id="retryErrorsButton" type="button">重试失败标的</button>
                 </div>
             </footer>
         </section>
@@ -417,6 +509,7 @@
     </div>
 
     <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="{{ url_for('static', filename='vendor/lightweight-charts/lightweight-charts.standalone.production.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
 </body>
 </html>

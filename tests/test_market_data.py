@@ -13,6 +13,8 @@ from market_data.providers.baostock_provider import BaoStockProvider
 from market_data.providers.eastmoney_provider import EastMoneyProvider
 from market_data.service import MarketDataService
 from stock_signal_monitor.scan_market import retry_scan_errors
+from stock_signal_monitor.scan_market import scan_market
+from stock_signal_monitor.stock_strategy import daily_strategy_window
 
 
 class FakeProvider:
@@ -134,6 +136,18 @@ class MarketDataServiceTest(unittest.TestCase):
         cached = self.database.load_klines("000001.SZ", "D", "2026-07-01", "2026-07-14")
         self.assertEqual(2, len(cached))
 
+    def test_skips_provider_that_does_not_support_symbol_market(self):
+        unsupported = FakeProvider("unsupported", error=AssertionError("unsupported provider must not be called"))
+        unsupported.supports_symbol = lambda _symbol: False
+        healthy = FakeProvider("healthy", sample_bars())
+        service = MarketDataService(self.database, [unsupported, healthy], [unsupported, healthy], max_retries=1)
+
+        result = service.get_daily_data("HSI.HK", "2026-07-01", "2026-07-14", force_refresh=True)
+
+        self.assertEqual("healthy", result.attrs["source"])
+        self.assertEqual(0, unsupported.calls)
+        self.assertEqual(1, healthy.calls)
+
     def test_uses_stale_sqlite_cache_when_all_network_sources_fail(self):
         self.database.save_klines("000001.SZ", "D", sample_bars(), "seed")
         broken = FakeProvider("broken", error=RuntimeError("offline"))
@@ -158,6 +172,23 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual("sqlite_cache", result.attrs["source"])
         self.assertEqual(0, provider.calls)
 
+    def test_daily_cache_missing_volume_is_refetched_and_persisted(self):
+        incomplete = sample_bars()
+        incomplete["vol"] = None
+        self.database.save_klines(
+            "000001.SZ", "D", incomplete, "seed", coverage_start="2026-07-01", coverage_end="2026-07-13"
+        )
+        provider = FakeProvider("network", sample_bars())
+        service = MarketDataService(
+            self.database, [provider], [provider], max_retries=1, now_provider=lambda: datetime(2026, 7, 15, 16, 0)
+        )
+
+        result = service.get_daily_data("000001.SZ", "2026-07-01", "2026-07-13")
+
+        self.assertEqual("network", result.attrs["source"])
+        self.assertEqual(1, provider.calls)
+        self.assertTrue(self.database.load_klines("000001.SZ", "D")["vol"].notna().all())
+
     def test_daily_cache_fetches_only_recent_overlap_for_missing_day(self):
         self.database.save_klines(
             "000001.SZ", "D", sample_bars(), "seed", coverage_start="2026-07-01", coverage_end="2026-07-13"
@@ -174,6 +205,23 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual("sqlite_cache", cached.attrs["source"])
         self.assertEqual(1, provider.calls)
         self.assertEqual(pd.Timestamp("2026-07-10"), provider.requests[0][2])
+        self.assertEqual(pd.Timestamp("2026-07-15"), provider.requests[0][3])
+
+    def test_intraday_daily_refresh_requires_and_persists_current_bar(self):
+        self.database.save_klines(
+            "000001.SH", "D", sample_bars(), "seed", coverage_start="2026-07-01", coverage_end="2026-07-13"
+        )
+        provider = FakeProvider("network", sample_bars_through_july_15())
+        service = MarketDataService(
+            self.database, [provider], [provider], max_retries=1, now_provider=lambda: datetime(2026, 7, 15, 10, 0)
+        )
+
+        result = service.get_daily_data(
+            "000001.SH", "2026-07-01", "2026-07-15", minimum_trade_time="2026-07-15", refresh_latest=True
+        )
+
+        self.assertEqual("network", result.attrs["source"])
+        self.assertEqual(pd.Timestamp("2026-07-15"), result["trade_time"].max())
         self.assertEqual(pd.Timestamp("2026-07-15"), provider.requests[0][3])
 
     def test_daily_cache_fills_missing_history_before_using_incremental_mode(self):
@@ -202,6 +250,52 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual(2, provider.calls)
         self.assertEqual(pd.Timestamp("2026-07-10"), provider.requests[0][2])
         self.assertEqual(pd.Timestamp("2026-07-01"), provider.requests[1][2])
+
+    def test_cached_scan_does_not_call_network_provider(self):
+        start_date, end_date = daily_strategy_window()
+        self.database.replace_stock_list(sample_stock_list(), "seed")
+        self.database.replace_etf_list(sample_etf_list(), "seed")
+        for symbol in ("000001.SZ", "600000.SH", "510300.SH", "159915.SZ"):
+            self.database.save_klines(symbol, "D", sample_bars(), "seed", coverage_start=start_date, coverage_end=end_date)
+        provider = FakeProvider("network", error=RuntimeError("offline"))
+        service = MarketDataService(self.database, [provider], [provider], max_retries=1, minimum_stock_count=1)
+
+        signal_dir = Path(self.temp_dir.name) / "signals"
+        with patch("stock_signal_monitor.scan_market.RESOURCE_DIR", signal_dir), \
+                patch("stock_signal_monitor.scan_market.daily_check", return_value=[StockStatus.NO_MATCH]):
+            result = scan_market(service)
+
+        self.assertEqual(4, result["processed_stocks"])
+        self.assertEqual(0, provider.calls)
+
+    def test_etf_scan_only_processes_etf_and_persists_scope(self):
+        start_date, end_date = daily_strategy_window()
+        self.database.replace_stock_list(sample_stock_list(), "seed")
+        self.database.replace_etf_list(sample_etf_list(), "seed")
+        for symbol in ("510300.SH", "159915.SZ"):
+            self.database.save_klines(symbol, "D", sample_bars(), "seed", coverage_start=start_date, coverage_end=end_date)
+        provider = FakeProvider("network", error=RuntimeError("offline"))
+        service = MarketDataService(self.database, [provider], [provider], max_retries=1, minimum_stock_count=1)
+
+        signal_dir = Path(self.temp_dir.name) / "etf-signals"
+        with patch("stock_signal_monitor.scan_market.RESOURCE_DIR", signal_dir), \
+                patch("stock_signal_monitor.scan_market.daily_check", return_value=[StockStatus.NO_MATCH]):
+            result = scan_market(service, asset_type="etf")
+
+        self.assertEqual(2, result["processed_stocks"])
+        self.assertEqual("etf", result["scan_scope"])
+        self.assertEqual("etf", self.database.get_scan_run(result["run_id"])["scan_scope"])
+        self.assertEqual(0, provider.calls)
+
+    @patch("time.sleep")
+    def test_network_retry_uses_exponential_backoff(self, sleep_mock):
+        provider = FakeProvider("broken", error=RuntimeError("offline"))
+        service = MarketDataService(self.database, [provider], [provider], max_retries=8)
+
+        with self.assertRaises(Exception):
+            service.get_daily_data("000001.SZ", "2026-07-01", "2026-07-14", force_refresh=True)
+
+        self.assertEqual([1, 2, 4, 8, 16, 32, 60], [call.args[0] for call in sleep_mock.call_args_list])
 
     def test_notification_state_is_persistent_and_idempotent(self):
         first = self.database.should_send_notification("000001:15min:MA10:up", "2026-07-14 10:00", "up")
@@ -343,6 +437,34 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual(1, summary["最近3天MACD金叉"])
         self.assertEqual("000001.SZ", signals[0]["ts_code"])
 
+    def test_signals_can_be_filtered_by_stock_and_etf(self):
+        run_id = self.database.start_scan_run(2)
+        self.database.save_stock_signals(run_id, "000001.SZ", "平安银行", ["最近3天MACD金叉"], asset_type="stock")
+        self.database.save_stock_signals(run_id, "510300.SH", "沪深300ETF", ["最近3天MACD金叉"], asset_type="etf")
+        self.database.finish_scan_run(run_id, "completed", 2, 2, 0)
+
+        stock_signals = self.database.get_latest_signals(asset_type="stock")
+        etf_signals = self.database.get_latest_signals(asset_type="etf")
+        etf_summary = self.database.get_signal_summary(asset_type="etf")
+
+        self.assertEqual(["000001.SZ"], [item["ts_code"] for item in stock_signals])
+        self.assertEqual(["510300.SH"], [item["ts_code"] for item in etf_signals])
+        self.assertEqual(1, etf_summary[0]["count"])
+
+    def test_scoped_scans_keep_latest_stock_and_etf_results_independent(self):
+        stock_run = self.database.start_scan_run(1, scan_scope="stock")
+        self.database.save_stock_signals(stock_run, "000001.SZ", "平安银行", ["最近3天MACD金叉"], asset_type="stock")
+        self.database.finish_scan_run(stock_run, "completed", 1, 1, 0)
+        etf_run = self.database.start_scan_run(1, scan_scope="etf")
+        self.database.save_stock_signals(etf_run, "510300.SH", "沪深300ETF", ["底部支撑反弹10日线"], asset_type="etf")
+        self.database.finish_scan_run(etf_run, "completed", 1, 1, 0)
+
+        stock_signals = self.database.get_latest_signals(asset_type="stock")
+        etf_signals = self.database.get_latest_signals(asset_type="etf")
+
+        self.assertEqual(["000001.SZ"], [item["ts_code"] for item in stock_signals])
+        self.assertEqual(["510300.SH"], [item["ts_code"] for item in etf_signals])
+
     def test_scan_errors_are_summarized_and_can_be_resolved(self):
         run_id = self.database.start_scan_run(2)
         self.database.save_scan_error(run_id, "000001.SZ", "平安银行", "TimeoutError", "请求超时")
@@ -458,6 +580,11 @@ class BaoStockProviderTest(unittest.TestCase):
     def tearDown(self):
         BaoStockProvider._shared_client = None
         BaoStockProvider._session_users = 0
+
+    def test_rejects_hong_kong_symbol_before_query(self):
+        provider = BaoStockProvider()
+
+        self.assertFalse(provider.supports_symbol("HSI.HK"))
 
     def test_session_error_triggers_one_relogin_and_retry(self):
         client = FakeBaoClient()

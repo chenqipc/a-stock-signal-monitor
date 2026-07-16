@@ -14,10 +14,8 @@ dependencies = [
     "pandas>=2.2,<3.0",
     "requests>=2.32,<3.0",
     "schedule>=1.2,<2.0",
+    "tushare>=1.4,<2.0",
 ]
-
-[project.optional-dependencies]
-tushare = ["tushare>=1.4,<2.0"]
 
 [project.scripts]
 a-stock-refresh = "stock_signal_monitor.refresh_stock_list:refresh_stock_list"
