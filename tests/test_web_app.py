@@ -133,13 +133,15 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('id="signalTableTitle"', page)
         self.assertIn('data-action="scan-current"', page)
         self.assertIn('startTask("scan", state.signalAssetType)', script)
+        self.assertIn("function signalPresentation", script)
         self.assertNotIn("策略信号中心", page)
         self.assertNotIn("任务中心", page)
         self.assertIn('data-view-target="etfs"', page)
         self.assertIn('data-view-target="settings-database"', page)
         self.assertIn('data-view-target="settings-maintenance"', page)
         self.assertIn('data-view-target="daily-custom"', page)
-        self.assertIn('data-view-target="daily-other"', page)
+        self.assertIn('data-view-target="daily-public"', page)
+        self.assertIn("公共指标", page)
         self.assertIn('data-view-target="minute-custom"', page)
         self.assertIn('data-view-target="minute-other"', page)
         self.assertIn('data-nav-collapse="daily"', page)
@@ -246,6 +248,36 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(2, payload["stats"]["etf_count"])
         self.assertEqual(1, payload["latest_scan"]["matched_stocks"])
         self.assertEqual("D", payload["indices"]["period"])
+
+    def test_daily_indicator_categories_are_separated(self):
+        self.database.save_stock_signals(
+            self.run_id, "600000.SH", "浦发银行", [StockStatus.MACD_GOLDEN_CROSS.value]
+        )
+        custom = self.client.get("/api/signals?asset_type=stock&category=custom").get_json()
+        public = self.client.get("/api/signals?asset_type=stock&category=public").get_json()
+
+        self.assertTrue(all(item["category"] == "custom" for item in custom["indicators"]))
+        self.assertEqual(
+            {StockStatus.MACD_GOLDEN_CROSS.value, StockStatus.DOUBLE_BOTTOM.value},
+            {item["label"] for item in public["indicators"]},
+        )
+        self.assertEqual([StockStatus.MACD_GOLDEN_CROSS.value], [item["signal_type"] for item in public["items"]])
+
+    def test_scored_signal_api_exposes_score_and_reasons(self):
+        signal_type = StockStatus.IS_UPWARD_TREND.value
+        details = {signal_type: {"score": 4, "total_score": 5, "reasons": ["MA10趋势向上"], "metrics": {}}}
+        self.database.save_stock_signals(
+            self.run_id,
+            "600000.SH",
+            "浦发银行",
+            [signal_type],
+            signal_details=details,
+        )
+
+        payload = self.client.get(f"/api/signals?type={signal_type}&category=custom").get_json()
+
+        self.assertEqual(4, payload["items"][0]["signal_score"])
+        self.assertEqual(["MA10趋势向上"], payload["items"][0]["signal_details"]["reasons"])
 
     def test_indices_endpoint_returns_major_market_trends(self):
         bars = sample_bars()

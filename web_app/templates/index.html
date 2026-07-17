@@ -34,7 +34,7 @@
                     </button>
                     <div class="nav-subitems" hidden>
                         <button class="nav-item nav-child" data-view-target="daily-custom" type="button">自定义策略</button>
-                        <button class="nav-item nav-child" data-view-target="daily-other" type="button">其他策略</button>
+                        <button class="nav-item nav-child" data-view-target="daily-public" type="button">公共指标</button>
                     </div>
                 </div>
                 <div class="nav-section strategy-nav-section" data-nav-group="realtime">
@@ -157,7 +157,8 @@
                 </div>
             </section>
 
-            <section class="view" id="view-daily-custom" data-view="daily-custom">
+            <!-- 自定义策略和公共指标共用交互视图，由接口分类返回各自目录与命中结果。 -->
+            <section class="view" id="view-daily-strategies" data-view="daily-custom daily-public">
                 <div class="signal-asset-tabs" role="tablist" aria-label="日线策略资产类型">
                     <button class="signal-asset-tab active" data-signal-asset="stock" role="tab" aria-selected="true" type="button">
                         <span>股票</span><small>STOCKS</small>
@@ -168,8 +169,8 @@
                 </div>
                 <article class="card panel strategy-selector-panel">
                     <div class="panel-head strategy-selector-head">
-                        <div><p class="panel-kicker">STRATEGY SELECTOR</p><h3>选择策略指标</h3></div>
-                        <span class="strategy-selector-hint">全部展开 · 点击即可筛选</span>
+                        <div><p class="panel-kicker">STRATEGY SELECTOR</p><h3 id="strategySelectorTitle">选择自定义策略</h3></div>
+                        <span class="strategy-selector-hint" id="strategySelectorHint">项目自定义 · 点击即可筛选</span>
                     </div>
                     <div class="strategy-filter-grid" id="indicatorFilters"><div class="empty-state">正在加载策略指标…</div></div>
                 </article>
@@ -189,13 +190,6 @@
                             <thead><tr><th>证券代码</th><th>名称</th><th>命中指标</th><th>记录时间</th><th>操作</th></tr></thead>
                         <tbody id="signalRows"><tr><td colspan="5" class="table-empty">暂无信号数据</td></tr></tbody></table>
                     </div>
-                </article>
-            </section>
-
-            <section class="view" id="view-daily-other" data-view="daily-other">
-                <article class="card panel placeholder-panel">
-                    <p class="panel-kicker">DAILY STRATEGIES</p><h3>日线其他策略</h3>
-                    <p class="panel-description">这里预留给非自定义来源的日线策略，当前暂无启用策略。</p>
                 </article>
             </section>
 
@@ -405,7 +399,9 @@
                     <div class="panel-head">
                         <div>
                             <p class="panel-kicker">DATA RETENTION</p><h3>行情数据维护</h3>
-                            <p class="panel-description compact-description">控制分钟K线的基础保留时间；系统还会保留均线计算所需的最少样本，历史日线始终永久保留。</p>
+                            <p class="panel-description compact-description">
+                                控制分钟K线的基础保留时间；系统还会保留均线计算所需的最少样本，历史日线始终永久保留。
+                            </p>
                         </div>
                         <span class="status-pill completed" id="maintenanceSettingsState">正在读取</span>
                     </div>

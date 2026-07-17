@@ -14,10 +14,24 @@ from market_data.config import RESOURCE_DIR, SCAN_CACHED_WORKERS
 from market_data.service import MarketDataService
 
 from .stock_status import StockStatus
-from .stock_strategy import daily_strategy_window, evaluate_daily_strategies
+from .stock_strategy import build_daily_signal_details, daily_strategy_window, evaluate_daily_strategies
 
 
 logger = logging.getLogger(__name__)
+
+DEPRECATED_SIGNAL_LABELS = (
+    "连续3天涨停",
+    "最近3天涨停",
+    "连续上涨且成交量放大",
+    "资金流入明显",
+    "底部支撑反弹10日线",
+    "底部支撑反弹60日均线",
+    "最近3天MACD金叉",
+    "最近7天MACD金叉",
+    "双底结构",
+    "双底结构(新)",
+    "处于上涨初期",
+)
 
 
 def scan_market(service=None, control=None, asset_type=None):
@@ -29,6 +43,8 @@ def scan_market(service=None, control=None, asset_type=None):
     (RESOURCE_DIR / f"{StockStatus.NO_MATCH.value}.txt").unlink(missing_ok=True)
     # 清理修正“换收率”错别字前的旧文件，避免新旧结果并存。
     (RESOURCE_DIR / "成交量换收率放大.txt").unlink(missing_ok=True)
+    for deprecated_label in DEPRECATED_SIGNAL_LABELS:
+        (RESOURCE_DIR / f"{deprecated_label}.txt").unlink(missing_ok=True)
     market_data_service = service or MarketDataService()
     run_id = None
     processed_stocks = 0
@@ -124,7 +140,14 @@ def stream_scan_results(rows, service, start_date, end_date, control=None, run_i
             else:
                 error = prepare_daily_cache(row, service, start_date, end_date)
                 if error:
-                    yield {"ts_code": row["ts_code"], "name": row["name"], "results": [], "error": error}
+                    yield {
+                        "ts_code": row["ts_code"],
+                        "name": row["name"],
+                        "asset_type": row.get("asset_type", "stock"),
+                        "results": [],
+                        "details": {},
+                        "error": error,
+                    }
                 else:
                     pending.add(executor.submit(scan_cached_row, row, service.database, start_date, end_date))
                 # 只有补数据路径需要限速，避免免费行情源被短时间打爆。
@@ -139,11 +162,7 @@ def stream_scan_results(rows, service, start_date, end_date, control=None, run_i
 
 
 def can_compute_from_database(row, service, start_date, end_date):
-    return can_skip_without_daily_data(row["ts_code"], row["name"]) or service.daily_cache_ready(row["ts_code"], start_date, end_date)
-
-
-def can_skip_without_daily_data(ts_code, stock_name):
-    return "ST" in stock_name or str(ts_code).startswith(("4", "8", "92", "688"))
+    return service.daily_cache_ready(row["ts_code"], start_date, end_date)
 
 
 def prepare_daily_cache(row, service, start_date, end_date):
@@ -184,10 +203,18 @@ def evaluate_stock_row(row: dict, daily_data: pd.DataFrame) -> dict:
     logger.debug("开始计算策略: %s %s", ts_code, name)
     try:
         results = evaluate_daily_strategies(daily_data, ts_code, name)
-        return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": results, "error": None}
+        details = build_daily_signal_details(daily_data, results)
+        return {
+            "ts_code": ts_code,
+            "name": name,
+            "asset_type": asset_type,
+            "results": results,
+            "details": details,
+            "error": None,
+        }
     except Exception as exc:
         logger.exception("策略计算失败: %s %s", ts_code, name)
-        return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": [], "error": exc}
+        return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": [], "details": {}, "error": exc}
 
 
 def wait_if_paused(control, database, run_id):
@@ -221,7 +248,14 @@ def handle_scan_result(context, result, processed_stocks, matched_stocks, error_
         context.files[status].flush()
     if matched_signal_types:
         matched_stocks += 1
-        context.service.database.save_stock_signals(context.run_id, ts_code, name, matched_signal_types, asset_type=asset_type)
+        context.service.database.save_stock_signals(
+            context.run_id,
+            ts_code,
+            name,
+            matched_signal_types,
+            asset_type=asset_type,
+            signal_details=result.get("details"),
+        )
     processed_stocks += 1
     if processed_stocks % 25 == 0:
         update_scan_progress(context.service.database, context.run_id, processed_stocks, matched_stocks, error_count)
@@ -267,7 +301,15 @@ def retry_scan_errors(run_id, service=None, control=None):
                 daily_data = market_data_service.get_daily_data(ts_code, start_date, end_date)
                 results = evaluate_daily_strategies(daily_data, ts_code, stock_name)
                 signal_types = [status.value for status in results if status != StockStatus.NO_MATCH]
-                database.save_stock_signals(run_id, ts_code, stock_name, signal_types, asset_type=asset_type)
+                signal_details = build_daily_signal_details(daily_data, results)
+                database.save_stock_signals(
+                    run_id,
+                    ts_code,
+                    stock_name,
+                    signal_types,
+                    asset_type=asset_type,
+                    signal_details=signal_details,
+                )
                 database.resolve_scan_error(run_id, ts_code)
                 resolved_count += 1
             except Exception as exc:

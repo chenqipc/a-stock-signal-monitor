@@ -20,7 +20,7 @@ from market_data.config import (
 from market_data.database import MarketDataDatabase
 from market_data.service import MarketDataService
 from market_data.trading_calendar import TRADING_SESSIONS
-from stock_signal_monitor.stock_status import StockStatus
+from stock_signal_monitor.stock_status import StockStatus, daily_strategy_category, daily_strategy_statuses
 
 from .index_service import IndexMarketService
 from .tasks import TaskManager
@@ -63,6 +63,7 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
         db = _database(app)
         latest_run = db.get_latest_scan_run()
         indicators = _indicator_catalog(db.get_signal_summary())
+        current_signal_labels = tuple(status.value for status in daily_strategy_statuses())
         return jsonify(
             {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -70,7 +71,7 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
                 "stats": db.get_dashboard_stats(),
                 "latest_scan": latest_run,
                 "indicators": indicators,
-                "latest_signals": db.get_latest_signals(limit=12),
+                "latest_signals": db.get_latest_signals(limit=12, signal_types=current_signal_labels),
                 "watchlist": _watchlist_payload(db),
                 "indices": {"items": _index_service(app).load_watchlist(120, refresh_missing=False), "period": "D"},
                 "sources": db.get_source_health(),
@@ -83,7 +84,11 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
         asset_type = request.args.get("asset_type", "").strip().lower()
         if asset_type and asset_type not in {"stock", "etf"}:
             return jsonify({"error": "资产类型必须是 stock 或 etf"}), 400
-        return jsonify({"items": _indicator_catalog(_database(app).get_signal_summary(asset_type=asset_type))})
+        category = request.args.get("category", "").strip().lower()
+        if category and category not in {"custom", "public"}:
+            return jsonify({"error": "指标分类必须是 custom 或 public"}), 400
+        summary = _database(app).get_signal_summary(asset_type=asset_type)
+        return jsonify({"items": _indicator_catalog(summary, category)})
 
     @app.get("/api/indices")
     def indices():
@@ -228,14 +233,21 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
         asset_type = request.args.get("asset_type", "").strip().lower()
         if asset_type and asset_type not in {"stock", "etf"}:
             return jsonify({"error": "资产类型必须是 stock 或 etf"}), 400
+        category = request.args.get("category", "").strip().lower()
+        if category and category not in {"custom", "public"}:
+            return jsonify({"error": "指标分类必须是 custom 或 public"}), 400
+        category_labels = tuple(status.value for status in daily_strategy_statuses(category))
         items = database.get_latest_signals(
             limit=_positive_int(request.args.get("limit"), 100),
             signal_type=request.args.get("type", "").strip(),
             query=request.args.get("q", "").strip(),
             asset_type=asset_type,
+            signal_types=category_labels,
         )
-        indicators = _indicator_catalog(database.get_signal_summary(asset_type=asset_type))
-        return jsonify({"items": items, "total": len(items), "asset_type": asset_type, "indicators": indicators})
+        indicators = _indicator_catalog(database.get_signal_summary(asset_type=asset_type), category)
+        return jsonify(
+            {"items": items, "total": len(items), "asset_type": asset_type, "category": category, "indicators": indicators}
+        )
 
     @app.get("/api/task-runs")
     @app.get("/api/scan-runs")
@@ -520,18 +532,17 @@ def _data_maintenance_settings_payload(app):
     }
 
 
-def _indicator_catalog(summary):
+def _indicator_catalog(summary, category=""):
     count_by_label = {item["signal_type"]: item["count"] for item in summary}
     indicators = []
-    for index, status in enumerate(StockStatus):
-        if status == StockStatus.NO_MATCH:
-            continue
+    for index, status in enumerate(daily_strategy_statuses(category)):
         indicators.append(
             {
                 "key": status.name,
                 "label": status.value,
                 "count": count_by_label.get(status.value, 0),
                 "tone": INDICATOR_TONES[index % len(INDICATOR_TONES)],
+                "category": daily_strategy_category(status),
             }
         )
     return indicators

@@ -12,6 +12,7 @@ from market_data.database import MarketDataDatabase
 from market_data.providers.baostock_provider import BaoStockProvider
 from market_data.providers.eastmoney_provider import EastMoneyProvider
 from market_data.service import MarketDataService
+from stock_signal_monitor.scan_market import can_compute_from_database
 from stock_signal_monitor.scan_market import retry_scan_errors
 from stock_signal_monitor.scan_market import scan_market
 from stock_signal_monitor.stock_strategy import daily_strategy_window
@@ -268,6 +269,20 @@ class MarketDataServiceTest(unittest.TestCase):
 
         self.assertEqual(4, result["processed_stocks"])
         self.assertEqual(0, provider.calls)
+
+    def test_st_star_market_and_beijing_rows_do_not_skip_daily_cache_preparation(self):
+        service = Mock()
+        service.daily_cache_ready.return_value = False
+        rows = (
+            {"ts_code": "600001.SH", "name": "*ST测试"},
+            {"ts_code": "688001.SH", "name": "科创测试"},
+            {"ts_code": "830001.BJ", "name": "北交测试"},
+        )
+
+        for row in rows:
+            self.assertFalse(can_compute_from_database(row, service, "20260101", "20260717"))
+
+        self.assertEqual(3, service.daily_cache_ready.call_count)
 
     def test_etf_scan_only_processes_etf_and_persists_scope(self):
         start_date, end_date = daily_strategy_window()
@@ -531,22 +546,50 @@ class MarketDataServiceTest(unittest.TestCase):
 
     def test_scan_run_and_signals_are_persisted(self):
         run_id = self.database.start_scan_run(2)
-        self.database.save_stock_signals(run_id, "000001.SZ", "平安银行", ["底部支撑反弹10日线", "最近3天MACD金叉"])
+        self.database.save_stock_signals(
+            run_id,
+            "000001.SZ",
+            "平安银行",
+            [StockStatus.SUPPORT_LEVEL_REBOUND.value, StockStatus.MACD_GOLDEN_CROSS.value],
+        )
         self.database.finish_scan_run(run_id, "completed", 2, 1, 0)
 
         latest_run = self.database.get_latest_scan_run()
         summary = {item["signal_type"]: item["count"] for item in self.database.get_signal_summary()}
-        signals = self.database.get_latest_signals(signal_type="底部支撑反弹10日线")
+        signals = self.database.get_latest_signals(signal_type=StockStatus.SUPPORT_LEVEL_REBOUND.value)
 
         self.assertEqual("completed", latest_run["status"])
         self.assertEqual(1, latest_run["matched_stocks"])
-        self.assertEqual(1, summary["最近3天MACD金叉"])
+        self.assertEqual(1, summary[StockStatus.MACD_GOLDEN_CROSS.value])
         self.assertEqual("000001.SZ", signals[0]["ts_code"])
+
+    def test_scored_signal_details_are_persisted_as_structured_data(self):
+        run_id = self.database.start_scan_run(1)
+        signal_type = StockStatus.IS_UPWARD_TREND.value
+        details = {
+            signal_type: {
+                "score": 4,
+                "total_score": 5,
+                "reasons": ["MA10趋势向上"],
+                "metrics": {"return_20d_pct": 8.2},
+            }
+        }
+        self.database.save_stock_signals(run_id, "000001.SZ", "平安银行", [signal_type], signal_details=details)
+        self.database.finish_scan_run(run_id, "completed", 1, 1, 0)
+
+        signal = self.database.get_latest_signals(signal_type=signal_type)[0]
+
+        self.assertEqual(4, signal["signal_score"])
+        self.assertEqual(details[signal_type], signal["signal_details"])
 
     def test_signals_can_be_filtered_by_stock_and_etf(self):
         run_id = self.database.start_scan_run(2)
-        self.database.save_stock_signals(run_id, "000001.SZ", "平安银行", ["最近3天MACD金叉"], asset_type="stock")
-        self.database.save_stock_signals(run_id, "510300.SH", "沪深300ETF", ["最近3天MACD金叉"], asset_type="etf")
+        self.database.save_stock_signals(
+            run_id, "000001.SZ", "平安银行", [StockStatus.MACD_GOLDEN_CROSS.value], asset_type="stock"
+        )
+        self.database.save_stock_signals(
+            run_id, "510300.SH", "沪深300ETF", [StockStatus.MACD_GOLDEN_CROSS.value], asset_type="etf"
+        )
         self.database.finish_scan_run(run_id, "completed", 2, 2, 0)
 
         stock_signals = self.database.get_latest_signals(asset_type="stock")
@@ -559,10 +602,14 @@ class MarketDataServiceTest(unittest.TestCase):
 
     def test_scoped_scans_keep_latest_stock_and_etf_results_independent(self):
         stock_run = self.database.start_scan_run(1, scan_scope="stock")
-        self.database.save_stock_signals(stock_run, "000001.SZ", "平安银行", ["最近3天MACD金叉"], asset_type="stock")
+        self.database.save_stock_signals(
+            stock_run, "000001.SZ", "平安银行", [StockStatus.MACD_GOLDEN_CROSS.value], asset_type="stock"
+        )
         self.database.finish_scan_run(stock_run, "completed", 1, 1, 0)
         etf_run = self.database.start_scan_run(1, scan_scope="etf")
-        self.database.save_stock_signals(etf_run, "510300.SH", "沪深300ETF", ["底部支撑反弹10日线"], asset_type="etf")
+        self.database.save_stock_signals(
+            etf_run, "510300.SH", "沪深300ETF", [StockStatus.SUPPORT_LEVEL_REBOUND.value], asset_type="etf"
+        )
         self.database.finish_scan_run(etf_run, "completed", 1, 1, 0)
 
         stock_signals = self.database.get_latest_signals(asset_type="stock")

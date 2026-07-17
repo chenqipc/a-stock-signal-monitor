@@ -4,21 +4,22 @@ import pandas as pd
 
 from etf_monitor.ma_monitor import detect_ma_crosses
 from stock_signal_monitor.stock_strategy import (
+    build_daily_signal_details,
+    calculate_macd,
+    calculate_upward_trend_score,
     evaluate_daily_strategies,
     get_price_limit_ratio,
     is_breakout_after_consolidation,
-    is_capital_inflow,
+    is_consecutive_rise_with_amount_expansion,
+    is_consecutive_rise_with_increasing_volume,
     is_double_bottom,
-    is_double_bottom_new,
     is_funds_inflow_by_volume_turnover,
-    is_limit_up_3days,
-    is_limit_up_only_3days,
+    is_limit_up_streak,
+    is_ma10_support_rebound,
     is_macd_golden_cross,
-    is_macd_golden_cross_7,
-    is_rising_with_volume_increase,
-    is_stock_stabilizing_over60,
+    is_volume_breakout_ma60,
 )
-from stock_signal_monitor.stock_status import StockStatus
+from stock_signal_monitor.stock_status import StockStatus, daily_strategy_statuses
 
 
 class StrategyTest(unittest.TestCase):
@@ -28,7 +29,7 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(0.30, float(get_price_limit_ratio("830001.BJ")))
         self.assertEqual(0.05, float(get_price_limit_ratio("600000.SH", is_st=True)))
 
-    def test_exactly_three_limit_ups_only_checks_the_previous_day(self):
+    def test_limit_up_streak_accepts_three_or_more_and_rejects_an_interruption(self):
         data = pd.DataFrame(
             {
                 "pre_close": [10.00, 10.10, 11.11, 12.22, 13.44],
@@ -37,10 +38,9 @@ class StrategyTest(unittest.TestCase):
                 "is_st": [0, 0, 0, 0, 0],
             }
         )
-        self.assertTrue(is_limit_up_3days(data, "600000.SH"))
-        self.assertFalse(is_limit_up_only_3days(data, "600000.SH"))
-        data.loc[1, "close"] = 10.50
-        self.assertTrue(is_limit_up_only_3days(data, "600000.SH"))
+        self.assertTrue(is_limit_up_streak(data, "600000.SH"))
+        data.loc[2, "close"] = 11.50
+        self.assertFalse(is_limit_up_streak(data, "600000.SH"))
 
     def test_ma_cross_uses_previous_bar_previous_average(self):
         data = pd.DataFrame(
@@ -57,27 +57,57 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual("up", crosses[30])
         self.assertIsNone(crosses[60])
 
-    def test_breakout_over_ma60_requires_a_real_cross(self):
-        closes = [10.0] * 59 + [9.0, 10.1]
-        data = pd.DataFrame({"close": closes, "vol": [1000.0] * len(closes)})
-        self.assertTrue(is_stock_stabilizing_over60(data))
+    def test_volume_breakout_ma60_requires_cross_volume_and_prior_below_days(self):
+        closes = [10.0] * 59 + [9.8] * 5 + [10.1]
+        data = pd.DataFrame({"close": closes, "vol": [1000.0] * 64 + [1300.0]})
+        self.assertTrue(is_volume_breakout_ma60(data))
         data.loc[len(data) - 2, "close"] = 10.2
-        self.assertFalse(is_stock_stabilizing_over60(data))
+        self.assertFalse(is_volume_breakout_ma60(data))
 
-    def test_rising_volume_and_capital_inflow_require_consistent_recent_strength(self):
-        rising = pd.DataFrame({"pct_chg": [0, 1, 1, 1], "vol": [90, 100, 105, 110]})
-        capital = pd.DataFrame({"amount": [100] * 7 + [125, 130, 135], "pct_chg": [0] * 7 + [1, 1, 1]})
+    def test_ma10_support_rebound_requires_touch_rising_average_and_latest_rebound(self):
+        closes = [9.0 + index * 0.1 for index in range(17)] + [10.5, 10.45, 10.7]
+        lows = list(closes)
+        ma10 = pd.Series(closes).rolling(10).mean()
+        lows[18] = ma10.iloc[18]
+        data = pd.DataFrame({"close": closes, "low": lows})
 
-        self.assertTrue(is_rising_with_volume_increase(rising))
-        self.assertTrue(is_capital_inflow(capital))
-        capital.loc[9, "pct_chg"] = -1
-        self.assertFalse(is_capital_inflow(capital))
+        self.assertTrue(is_ma10_support_rebound(data))
+        data.loc[18, "low"] = ma10.iloc[18] * 0.95
+        self.assertFalse(is_ma10_support_rebound(data))
+
+    def test_rising_volume_and_amount_expansion_require_consistent_recent_strength(self):
+        rising = pd.DataFrame({"pct_chg": [0] * 10 + [1, 1, 1], "vol": [100] * 10 + [115, 120, 125]})
+        amount = pd.DataFrame(
+            {
+                "close": [10.0] * 11 + [10.2, 10.4, 10.6],
+                "amount": [100] * 11 + [125, 130, 135],
+                "pct_chg": [0] * 11 + [1, 1, 1],
+            }
+        )
+
+        self.assertTrue(is_consecutive_rise_with_increasing_volume(rising))
+        self.assertTrue(is_consecutive_rise_with_amount_expansion(amount))
+        rising.loc[12, "vol"] = 119
+        self.assertFalse(is_consecutive_rise_with_increasing_volume(rising))
+        amount.loc[13, "pct_chg"] = -1
+        self.assertFalse(is_consecutive_rise_with_amount_expansion(amount))
 
     def test_breakout_after_consolidation_requires_price_and_volume_expansion(self):
         data = pd.DataFrame({"close": [10] * 30 + [10, 10.1, 10.2, 10.3, 10.5], "vol": [100] * 30 + [130] * 5})
 
         self.assertTrue(is_breakout_after_consolidation(data))
         data.loc[30:, "vol"] = 105
+        self.assertFalse(is_breakout_after_consolidation(data))
+
+    def test_breakout_after_consolidation_rejects_rising_price_below_resistance(self):
+        consolidation = [10.0 + (index % 5) * 0.1 for index in range(30)]
+        data = pd.DataFrame(
+            {
+                "close": consolidation + [10.00, 10.05, 10.10, 10.15, 10.20],
+                "vol": [100.0] * 30 + [130.0] * 5,
+            }
+        )
+
         self.assertFalse(is_breakout_after_consolidation(data))
 
     def test_volume_turnover_inflow_requires_both_metrics_to_expand(self):
@@ -93,33 +123,69 @@ class StrategyTest(unittest.TestCase):
         data.loc[30:, "turnover_rate"] = 1.05
         self.assertFalse(is_funds_inflow_by_volume_turnover(data))
 
-    def test_both_double_bottom_algorithms_detect_confirmed_breakout(self):
-        closes = [11.0] * 35
-        volumes = [1000.0] * 35
-        closes[5], volumes[5] = 10.0, 1200
-        closes[12] = 12.0
-        closes[20], volumes[20] = 10.2, 700
-        closes[21:25] = [10.5] * 4
-        closes[25], volumes[25] = 11.0, 2000
-        self.assertTrue(is_double_bottom(pd.DataFrame({"close": closes, "vol": volumes})))
-
-        closes = [12.0] * 40
-        volumes = [1000.0] * 40
-        pattern = [12, 11.5, 11, 10.5, 10, 10.5, 11, 12, 13, 12.5, 12, 11.5, 11, 10.6, 10.2, 10.6, 11, 12, 13, 14]
-        closes[4:24] = pattern
-        volumes[8], volumes[18], volumes[23] = 1200, 700, 2000
+    def test_double_bottom_requires_a_recent_volume_confirmed_neckline_breakout(self):
+        closes = [12.0] * 50
+        volumes = [1000.0] * 50
+        closes[10], volumes[10] = 10.0, 1300.0
+        closes[17] = 13.0
+        closes[25], volumes[25] = 10.2, 600.0
+        closes[49], volumes[49] = 13.2, 2000.0
         data = pd.DataFrame({"close": closes, "vol": volumes})
-        self.assertTrue(is_double_bottom_new(data, window=2, min_days=5, max_days=20))
 
-    def test_macd_cross_windows_detect_recent_reversal(self):
+        self.assertTrue(is_double_bottom(data, local_window=2))
+        data.loc[49, "close"] = 12.9
+        self.assertFalse(is_double_bottom(data, local_window=2))
+        data.loc[40, ["close", "vol"]] = [13.2, 2000.0]
+        self.assertFalse(is_double_bottom(data, local_window=2))
+
+    def test_standard_macd_detects_recent_dif_dea_cross(self):
         closes = [10 - index * 0.1 for index in range(20)] + [8.1, 8.2, 8.5, 9, 10, 11, 12]
         data = pd.DataFrame({"close": closes})
 
-        self.assertTrue(is_macd_golden_cross(data, short_window=2, long_window=5, signal_window=2, days=7))
-        self.assertTrue(
-            is_macd_golden_cross_7(
-                data, short_window=2, long_window=5, signal_window=2, recent_days=7, max_price_change=0.2
+        macd = calculate_macd(data, short_window=2, long_window=5, signal_window=2)
+        self.assertTrue(pd.isna(macd["dea"].iloc[4]))
+        self.assertFalse(pd.isna(macd["dea"].iloc[5]))
+        self.assertTrue(is_macd_golden_cross(data, short_window=2, long_window=5, signal_window=2, recent_days=7))
+
+    def test_upward_trend_score_matches_four_of_five_and_exposes_reasons(self):
+        closes = [10.0] * 60 + [10.0 + index * 0.05 for index in range(21)]
+        volumes = [100.0] * 76 + [130.0] * 5
+        data = pd.DataFrame({"trade_time": pd.date_range("2026-01-01", periods=81), "close": closes, "vol": volumes})
+
+        evaluation = calculate_upward_trend_score(data)
+        details = build_daily_signal_details(data, [StockStatus.IS_UPWARD_TREND])
+
+        self.assertTrue(evaluation["matched"])
+        self.assertGreaterEqual(evaluation["score"], 4)
+        self.assertEqual(evaluation["score"], details[StockStatus.IS_UPWARD_TREND.value]["score"])
+        self.assertTrue(details[StockStatus.IS_UPWARD_TREND.value]["reasons"])
+
+    def test_st_star_market_and_beijing_instruments_are_not_filtered(self):
+        cases = (
+            ("600001.SH", "*ST测试", [10.50, 11.03, 11.58], [10.00, 10.50, 11.03]),
+            ("688001.SH", "科创测试", [12.00, 14.40, 17.28], [10.00, 12.00, 14.40]),
+            ("830001.BJ", "北交测试", [13.00, 16.90, 21.97], [10.00, 13.00, 16.90]),
+        )
+        for ts_code, stock_name, limit_closes, pre_closes in cases:
+            rows = 61
+            data = pd.DataFrame(
+                {
+                    "trade_time": pd.date_range("2026-01-01", periods=rows),
+                    "close": [10.0] * (rows - 3) + limit_closes,
+                    "pre_close": [10.0] * (rows - 3) + pre_closes,
+                    "pct_chg": [0.0] * (rows - 3) + [30.0] * 3,
+                    "vol": [1000.0] * rows,
+                    "amount": [10000.0] * rows,
+                    "turnover_rate": [1.0] * rows,
+                }
             )
+            with self.subTest(ts_code=ts_code):
+                self.assertIn(StockStatus.LIMIT_UP_STREAK, evaluate_daily_strategies(data, ts_code, stock_name))
+
+    def test_public_indicator_catalog_contains_only_macd_and_double_bottom(self):
+        self.assertEqual(
+            (StockStatus.MACD_GOLDEN_CROSS, StockStatus.DOUBLE_BOTTOM),
+            daily_strategy_statuses("public"),
         )
 
     def test_pure_strategy_evaluator_does_not_mutate_caller_dataframe(self):

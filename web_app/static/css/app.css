@@ -1105,6 +1105,36 @@ table > tbody > tr > td {
     font-weight: 650;
 }
 
+.signal-presentation {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+}
+
+.signal-presentation-line {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.signal-score {
+    padding: 4px 7px;
+    border-radius: 7px;
+    background: var(--green-soft);
+    color: var(--green);
+    font-size: 12px;
+    font-weight: 750;
+    font-variant-numeric: tabular-nums;
+}
+
+.signal-reasons {
+    max-width: 680px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: normal;
+}
+
 .table-empty,
 .empty-state {
     padding: 28px 10px !important;
@@ -1153,7 +1183,7 @@ table > tbody > tr > td {
     padding: 14px;
 }
 
-/* 日线自定义策略全部平铺展示，避免策略增多后依赖横向滚动才能选择。 */
+/* 日线自定义策略和公共指标全部平铺展示，避免指标增多后依赖横向滚动才能选择。 */
 .signal-asset-tabs {
     display: inline-flex;
     gap: 5px;

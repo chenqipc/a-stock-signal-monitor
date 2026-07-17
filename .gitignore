@@ -182,19 +182,5 @@ resource/app_settings.json*
 # 行情账号密钥仅保存在本机；示例文件可以提交。
 resource/local_secrets.json
 !resource/local_secrets.example.json
-双底结构.txt
-底部支撑反弹10日线.txt
-最近3天MACD金叉.txt
-最近3天大幅放量伴随股价上涨.txt
-最近3天涨停.txt
-最近7天MACD金叉.txt
-横盘后放量上涨.txt
-资金流入明显.txt
-连续3天涨停.txt
-连续上涨且成交量放大.txt
-不符合条件.txt
-处于上涨初期.txt
-底部支撑反弹60日均线.txt
-成交量换收率放大.txt
-成交量换手率放大.txt
-双底结构(新).txt
+# 日线扫描的文本结果可由数据库重新生成，新增策略时也统一忽略。
+resource/*.txt

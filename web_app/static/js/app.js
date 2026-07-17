@@ -7,6 +7,7 @@ const state = {
     dashboard: null,
     indicators: [],
     selectedSignal: "",
+    signalCategory: "custom",
     signalAssetType: "stock",
     stockPage: 1,
     stockPageSize: 20,
@@ -75,7 +76,7 @@ const state = {
 const viewMeta = {
     overview: ["MARKET INTELLIGENCE", "监控总览"],
     "daily-custom": ["DAILY SIGNALS", "日线策略信号 · 自定义策略"],
-    "daily-other": ["DAILY SIGNALS", "日线策略信号 · 其他策略"],
+    "daily-public": ["DAILY INDICATORS", "日线策略信号 · 公共指标"],
     "minute-custom": ["REALTIME SIGNALS", "实时策略信号 · 自定义策略"],
     "minute-other": ["REALTIME SIGNALS", "实时策略信号 · 其他策略"],
     stocks: ["STOCK UNIVERSE", "股票列表"],
@@ -146,7 +147,10 @@ function showView(viewName) {
     if (viewName === "signals") viewName = "daily-custom";
     if (viewName === "settings") viewName = "settings-database";
     state.currentView = viewName;
-    document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.dataset.view === viewName));
+    document.querySelectorAll(".view").forEach((view) => {
+        const supportedViews = (view.dataset.view || "").split(/\s+/);
+        view.classList.toggle("active", supportedViews.includes(viewName));
+    });
     document.querySelectorAll("[data-view-target]").forEach((button) => {
         button.classList.toggle("active", button.dataset.viewTarget === viewName);
     });
@@ -155,7 +159,11 @@ function showView(viewName) {
     document.getElementById("pageEyebrow").textContent = eyebrow;
     document.getElementById("pageTitle").textContent = title;
     location.hash = viewName;
-    if (viewName === "daily-custom") {
+    if (viewName === "daily-custom" || viewName === "daily-public") {
+        const nextCategory = viewName === "daily-public" ? "public" : "custom";
+        if (state.signalCategory !== nextCategory) state.selectedSignal = "";
+        state.signalCategory = nextCategory;
+        updateDailyStrategyHeading();
         // 从首页指标卡进入时同步选中状态，让策略矩阵与表格结果始终保持一致。
         renderIndicatorFilters();
         loadSignals();
@@ -341,14 +349,13 @@ async function loadDashboard() {
     try {
         const data = await api("/api/dashboard");
         state.dashboard = data;
-        state.indicators = data.indicators || [];
         renderMarket(data.market);
         renderMetrics(data);
         renderIndicators(data.indicators || []);
         renderLatestSignals(data.latest_signals || []);
         renderSources(data.sources || []);
         renderTasks(data.tasks || {}, data.latest_scan);
-        renderIndicatorFilters();
+        if (state.currentView === "daily-custom" || state.currentView === "daily-public") renderIndicatorFilters();
         const indexItems = data.indices?.items || [];
         renderIndexTabs(indexItems);
         if (needsIndexRefresh(indexItems)) loadIndexTrends(true);
@@ -397,8 +404,9 @@ function renderIndicators(indicators) {
     container.innerHTML = sorted.slice(0, 10).map((item) => indicatorCard(item)).join("");
     container.querySelectorAll(".indicator-card").forEach((button) => {
         button.addEventListener("click", () => {
+            state.signalCategory = button.dataset.category || "custom";
             state.selectedSignal = button.dataset.signal;
-            showView("daily-custom");
+            showView(state.signalCategory === "public" ? "daily-public" : "daily-custom");
         });
     });
 }
@@ -406,7 +414,8 @@ function renderIndicators(indicators) {
 function indicatorCard(item) {
     const tone = toneColors[item.tone] || "var(--green)";
     return `
-        <button class="indicator-card" data-signal="${escapeHtml(item.label)}" type="button" style="--tone:${tone}">
+        <button class="indicator-card" data-signal="${escapeHtml(item.label)}" data-category="${escapeHtml(item.category || "custom")}" type="button"
+        style="--tone:${tone}">
             <i class="indicator-dot"></i><span class="indicator-name" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</span>
             <strong class="indicator-count">${formatNumber(item.count)}</strong>
         </button>
@@ -421,8 +430,20 @@ function renderLatestSignals(items) {
     }
     rows.innerHTML = items.map((item) => `
         <tr><td><div class="stock-cell"><strong>${escapeHtml(item.stock_name)}</strong><span>${escapeHtml(item.ts_code)}</span></div></td>
-        <td><span class="signal-tag">${escapeHtml(item.signal_type)}</span></td><td>#${item.run_id}</td></tr>
+        <td>${signalPresentation(item, true)}</td><td>#${item.run_id}</td></tr>
     `).join("");
+}
+
+function signalPresentation(item, compact = false) {
+    const details = item.signal_details || {};
+    const score = item.signal_score ?? details.score;
+    const totalScore = details.total_score || 5;
+    const reasons = Array.isArray(details.reasons) ? details.reasons : [];
+    return `<div class="signal-presentation">
+        <div class="signal-presentation-line"><span class="signal-tag">${escapeHtml(item.signal_type)}</span>
+        ${score == null ? "" : `<span class="signal-score">${formatNumber(score)}/${formatNumber(totalScore)}</span>`}</div>
+        ${compact || !reasons.length ? "" : `<small class="signal-reasons">${reasons.map(escapeHtml).join(" · ")}</small>`}
+    </div>`;
 }
 
 async function loadIndexTrends(refreshMissing = false) {
@@ -1503,14 +1524,15 @@ function renderIndicatorFilters() {
     const container = document.getElementById("indicatorFilters");
     const totalCount = state.indicators.reduce((total, item) => total + Number(item.count || 0), 0);
     const assetLabel = state.signalAssetType === "etf" ? "ETF" : "股票";
-    const items = [{ label: "全部策略", count: totalCount, summary: `${state.indicators.length} 个${assetLabel}日线策略` }, ...state.indicators];
+    const categoryLabel = state.signalCategory === "public" ? "公共指标" : "自定义策略";
+    const items = [{ label: `全部${categoryLabel}`, count: totalCount, summary: `${state.indicators.length} 个${assetLabel}${categoryLabel}` }, ...state.indicators];
     container.innerHTML = items.map((item) => `
         <button class="strategy-filter-card ${state.selectedSignal === (item.key ? item.label : "") ? "active" : ""}"
         data-signal="${item.key ? escapeHtml(item.label) : ""}" type="button" aria-pressed="${state.selectedSignal === (item.key ? item.label : "")}"
         style="--strategy-tone:${toneColors[item.tone] || "var(--green)"}">
             <span class="strategy-filter-marker"></span>
             <span class="strategy-filter-copy"><strong>${escapeHtml(item.label)}</strong>
-            <small>${escapeHtml(item.summary || `${assetLabel}日线自定义策略`)}</small></span>
+            <small>${escapeHtml(item.summary || `${assetLabel}日线${categoryLabel}`)}</small></span>
             <span class="strategy-filter-count">${formatNumber(item.count || 0)}</span>
         </button>
     `).join("");
@@ -1525,7 +1547,7 @@ function renderIndicatorFilters() {
 
 async function loadSignals() {
     const query = document.getElementById("signalSearch").value.trim();
-    const params = new URLSearchParams({ limit: "500", q: query, asset_type: state.signalAssetType });
+    const params = new URLSearchParams({ limit: "500", q: query, asset_type: state.signalAssetType, category: state.signalCategory });
     if (state.selectedSignal) params.set("type", state.selectedSignal);
     try {
         const data = await api(`/api/signals?${params}`);
@@ -1534,7 +1556,8 @@ async function loadSignals() {
         renderIndicatorFilters();
         document.getElementById("signalResultCount").textContent = `${data.total} 条`;
         const assetLabel = state.signalAssetType === "etf" ? "ETF" : "股票";
-        document.getElementById("signalTableTitle").textContent = state.selectedSignal || `全部${assetLabel}指标`;
+        const categoryLabel = state.signalCategory === "public" ? "公共指标" : "自定义策略";
+        document.getElementById("signalTableTitle").textContent = state.selectedSignal || `全部${assetLabel}${categoryLabel}`;
         if (!data.items.length) {
             rows.innerHTML = `<tr><td colspan="5" class="table-empty">当前条件下暂无命中${assetLabel}</td></tr>`;
             return;
@@ -1542,7 +1565,7 @@ async function loadSignals() {
         rows.innerHTML = data.items.map((item) => {
             const instrument = { ts_code: item.ts_code, name: item.stock_name };
             return `<tr ${instrumentPreviewAttributes(instrument)}><td><strong>${escapeHtml(item.ts_code)}</strong></td>
-                <td>${instrumentNameCell(instrument)}</td><td><span class="signal-tag">${escapeHtml(item.signal_type)}</span></td>
+                <td>${instrumentNameCell(instrument)}</td><td>${signalPresentation(item)}</td>
                 <td>${formatDate(item.created_at)}</td><td><button class="row-action daily-view-action" data-view-daily="${escapeHtml(item.ts_code)}"
                 data-name="${escapeHtml(item.stock_name)}" type="button">查看日线</button></td></tr>`;
         }).join("");
@@ -1550,6 +1573,12 @@ async function loadSignals() {
     } catch (error) {
         toast(error.message, true);
     }
+}
+
+function updateDailyStrategyHeading() {
+    const isPublic = state.signalCategory === "public";
+    document.getElementById("strategySelectorTitle").textContent = isPublic ? "选择公共指标" : "选择自定义策略";
+    document.getElementById("strategySelectorHint").textContent = isPublic ? "通行技术指标 · 点击即可筛选" : "项目自定义 · 点击即可筛选";
 }
 
 function selectSignalAssetType(assetType) {

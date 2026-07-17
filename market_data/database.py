@@ -1,5 +1,6 @@
 """基于 SQLite 的历史K线、交易日历和通知状态存储。"""
 
+import json
 import sqlite3
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
@@ -191,6 +192,8 @@ class MarketDataDatabase:
                     stock_name TEXT NOT NULL,
                     asset_type TEXT NOT NULL DEFAULT 'stock',
                     signal_type TEXT NOT NULL,
+                    signal_score INTEGER,
+                    signal_details TEXT,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (run_id, ts_code, signal_type),
                     FOREIGN KEY (run_id) REFERENCES scan_run(id)
@@ -223,6 +226,8 @@ class MarketDataDatabase:
             self._ensure_column(connection, "scan_run", "scan_scope", "TEXT NOT NULL DEFAULT 'all'")
             self._ensure_column(connection, "scan_run", "parent_run_id", "INTEGER")
             self._ensure_column(connection, "stock_signal", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
+            self._ensure_column(connection, "stock_signal", "signal_score", "INTEGER")
+            self._ensure_column(connection, "stock_signal", "signal_details", "TEXT")
             self._ensure_column(connection, "scan_error", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
             self._ensure_column(connection, "kline", "ma10", "REAL")
             self._ensure_column(connection, "kline", "ma30", "REAL")
@@ -909,17 +914,30 @@ class MarketDataDatabase:
             )
         return cursor.rowcount
 
-    def save_stock_signals(self, run_id, ts_code, stock_name, signal_types, asset_type="stock"):
+    def save_stock_signals(self, run_id, ts_code, stock_name, signal_types, asset_type="stock", signal_details=None):
         created_at = self._utc_now()
         normalized_asset_type = self._normalize_asset_type(asset_type)
-        rows = [(run_id, ts_code, stock_name, normalized_asset_type, signal_type, created_at) for signal_type in signal_types]
+        details_by_type = signal_details or {}
+        rows = []
+        for signal_type in signal_types:
+            detail = details_by_type.get(signal_type) or {}
+            score = detail.get("score") if isinstance(detail, dict) else None
+            serialized_detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":")) if detail else None
+            rows.append((run_id, ts_code, stock_name, normalized_asset_type, signal_type, score, serialized_detail, created_at))
         if not rows:
             return
         with self._connect() as connection:
             connection.executemany(
                 """
-                INSERT OR IGNORE INTO stock_signal(run_id, ts_code, stock_name, asset_type, signal_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO stock_signal(
+                    run_id, ts_code, stock_name, asset_type, signal_type, signal_score, signal_details, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, ts_code, signal_type) DO UPDATE SET
+                    stock_name = excluded.stock_name,
+                    asset_type = excluded.asset_type,
+                    signal_score = excluded.signal_score,
+                    signal_details = excluded.signal_details,
+                    created_at = excluded.created_at
                 """,
                 rows,
             )
@@ -1096,7 +1114,7 @@ class MarketDataDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_latest_signals(self, limit=100, signal_type="", query="", asset_type=""):
+    def get_latest_signals(self, limit=100, signal_type="", query="", asset_type="", signal_types=None):
         run_id = self._latest_completed_run_id(asset_type)
         if not run_id:
             return []
@@ -1105,6 +1123,13 @@ class MarketDataDatabase:
         if signal_type:
             conditions.append("signal_type = ?")
             params.append(signal_type)
+        if signal_types is not None:
+            normalized_signal_types = tuple(str(item) for item in signal_types)
+            if not normalized_signal_types:
+                return []
+            placeholders = ", ".join("?" for _ in normalized_signal_types)
+            conditions.append(f"signal_type IN ({placeholders})")
+            params.extend(normalized_signal_types)
         if asset_type:
             conditions.append("asset_type = ?")
             params.append(self._normalize_asset_type(asset_type))
@@ -1116,13 +1141,22 @@ class MarketDataDatabase:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT run_id, ts_code, stock_name, asset_type, signal_type, created_at
+                SELECT run_id, ts_code, stock_name, asset_type, signal_type, signal_score, signal_details, created_at
                 FROM stock_signal WHERE {' AND '.join(conditions)}
                 ORDER BY signal_type, ts_code LIMIT ?
                 """,
                 params,
             ).fetchall()
-        return [dict(row) for row in rows]
+        items = []
+        for row in rows:
+            item = dict(row)
+            serialized_detail = item.get("signal_details")
+            try:
+                item["signal_details"] = json.loads(serialized_detail) if serialized_detail else None
+            except (TypeError, json.JSONDecodeError):
+                item["signal_details"] = None
+            items.append(item)
+        return items
 
     def _latest_completed_run_id(self, asset_type=""):
         conditions = ["status = 'completed'", "task_type = ?"]

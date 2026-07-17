@@ -22,32 +22,47 @@ def daily_check(ts_code: str, stock_name: str, service=None) -> list[StockStatus
 
 def evaluate_daily_strategies(daily_data: pd.DataFrame, ts_code: str, stock_name: str) -> list[StockStatus]:
     """只基于传入日线计算策略，不访问网络、数据库或全局服务。"""
-    if "ST" in stock_name:
-        return [StockStatus.NO_MATCH]
-    if ts_code.startswith(("4", "8", "92", "688")):
-        return [StockStatus.NO_MATCH]
     if daily_data is None or len(daily_data) < 7:
         return [StockStatus.NO_MATCH]
     sort_column = "trade_date" if "trade_date" in daily_data.columns else "trade_time"
     prepared_data = daily_data.sort_values(by=sort_column, ascending=True).reset_index(drop=True).copy()
+    # ST、北交所和科创板均进入策略计算；名称用于补齐部分免费行情源缺失的ST标记。
+    if "is_st" not in prepared_data.columns:
+        prepared_data["is_st"] = "ST" in stock_name.upper()
+    elif "ST" in stock_name.upper():
+        prepared_data["is_st"] = True
     checks = (
-        (StockStatus.THREE_LIMIT_UP, lambda: is_limit_up_3days(prepared_data, ts_code)),
-        (StockStatus.THREE_LIMIT_UP_ONLY, lambda: is_limit_up_only_3days(prepared_data, ts_code)),
-        (StockStatus.RISING_VOLUME_INCREASE, lambda: is_rising_with_volume_increase(prepared_data, days=3)),
+        (StockStatus.LIMIT_UP_STREAK, lambda: is_limit_up_streak(prepared_data, ts_code)),
+        (StockStatus.RISING_VOLUME_INCREASE, lambda: is_consecutive_rise_with_increasing_volume(prepared_data)),
         (StockStatus.VOLUME_SURGE_WITH_PRICE_RISE, lambda: is_volume_surge_with_price_rise(prepared_data, days=3)),
-        (StockStatus.CAPITAL_INFLOW, lambda: is_capital_inflow(prepared_data)),
-        (StockStatus.SUPPORT_LEVEL_REBOUND, lambda: is_stock_stabilizing(prepared_data, days=3)),
-        (StockStatus.SUPPORT_LEVEL_REBOUND_60, lambda: is_stock_stabilizing_over60(prepared_data)),
+        (StockStatus.CAPITAL_INFLOW, lambda: is_consecutive_rise_with_amount_expansion(prepared_data)),
+        (StockStatus.SUPPORT_LEVEL_REBOUND, lambda: is_ma10_support_rebound(prepared_data)),
+        (StockStatus.SUPPORT_LEVEL_REBOUND_60, lambda: is_volume_breakout_ma60(prepared_data)),
         (StockStatus.MACD_GOLDEN_CROSS, lambda: is_macd_golden_cross(prepared_data)),
-        (StockStatus.MACD_GOLDEN_CROSS_OVER_7, lambda: is_macd_golden_cross_7(prepared_data)),
         (StockStatus.DOUBLE_BOTTOM, lambda: is_double_bottom(prepared_data)),
-        (StockStatus.DOUBLE_BOTTOM_NEW, lambda: is_double_bottom_new(prepared_data)),
         (StockStatus.BREAKOUT_AFTER_CONSOLIDATION, lambda: is_breakout_after_consolidation(prepared_data)),
-        (StockStatus.IS_UPWARD_TREND, lambda: is_upward_trend(prepared_data)),
+        (StockStatus.IS_UPWARD_TREND, lambda: calculate_upward_trend_score(prepared_data)["matched"]),
         (StockStatus.FUNDS_INFLOW_BY_VOLUME_TURNOVER, lambda: is_funds_inflow_by_volume_turnover(prepared_data)),
     )
     results = [status for status, check in checks if check()]
     return results or [StockStatus.NO_MATCH]
+
+
+def build_daily_signal_details(daily_data: pd.DataFrame, results: list[StockStatus]) -> dict:
+    """生成需要随信号持久化的解释信息；普通布尔策略无需重复保存详情。"""
+    if StockStatus.IS_UPWARD_TREND not in results or daily_data is None or daily_data.empty:
+        return {}
+    sort_column = "trade_date" if "trade_date" in daily_data.columns else "trade_time"
+    prepared_data = daily_data.sort_values(by=sort_column, ascending=True).reset_index(drop=True).copy()
+    evaluation = calculate_upward_trend_score(prepared_data)
+    return {
+        StockStatus.IS_UPWARD_TREND.value: {
+            "score": evaluation["score"],
+            "total_score": evaluation["total_score"],
+            "reasons": evaluation["reasons"],
+            "metrics": evaluation["metrics"],
+        }
+    }
 
 
 def daily_strategy_window(today=None):
@@ -55,35 +70,6 @@ def daily_strategy_window(today=None):
     today = today or datetime.today()
     history_start = today - timedelta(days=200)
     return history_start.strftime('%Y%m%d'), today.strftime('%Y%m%d')
-
-def get_recent_days_data(daily_data, days=30, sort=False):
-    """
-    从原始数据中获取最近指定天数的数据。
-
-    参数:
-    daily_data (pd.DataFrame): 原始数据，假设包含日期索引。
-    days (int): 要获取的最近天数，默认为30天。
-    sort (bool): 是否按日期索引排序，默认为False。如果数据已经排序，可以保持False以提高效率。
-
-    返回:
-    pd.DataFrame: 最近指定天数的数据。
-    """
-    # 复制数据以避免修改原始数据
-    daily_data_copy = daily_data.copy()
-
-    # 获取最近指定天数的数据
-    recent_days_data = daily_data_copy.tail(days)
-
-    # 如果需要，按日期索引排序
-    if sort:
-        recent_days_data = recent_days_data.sort_index(ascending=True)
-
-    return recent_days_data
-
-
-# 示例用法
-# 假设 daily_data 是一个已经按日期索引排序的Pandas DataFrame
-# recent_30_days_data = get_recent_days_data(daily_data)
 
 def get_price_limit_ratio(ts_code, is_st=False):
     """按证券范围返回涨跌停比例，避免用统一9.89%判断所有板块。"""
@@ -109,45 +95,27 @@ def is_limit_up_row(row, ts_code):
     return row.get('pct_chg', float('-inf')) >= float(ratio * 100) - 0.01
 
 
-def is_limit_up_3days(daily_data, ts_code=''):
-    """判断是否连续3天涨停"""
-    # 确保有足够的天数进行判断
-    if len(daily_data) < 3:
+def is_limit_up_streak(daily_data, ts_code='', minimum_days=3):
+    """判断标的截至最新交易日是否至少连续涨停指定天数。"""
+    if minimum_days <= 0 or len(daily_data) < minimum_days:
         return False
-
-    # recent_30_days_data = get_recent_days_data(daily_data)
-
-    return all(is_limit_up_row(row, ts_code) for _, row in daily_data.iloc[-3:].iterrows())
+    return all(is_limit_up_row(row, ts_code) for _, row in daily_data.iloc[-minimum_days:].iterrows())
 
 
-def is_limit_up_only_3days(daily_data, ts_code=''):
-    """
-    判断最近三天（不包括更早）是否连续3天涨停。
-    如果涨停超过3天，则过滤掉。
-    :param daily_data: 股票的每日数据，按日期升序排列
-    :return: 如果满足条件返回True，否则返回False
-    """
-    # 需要第4天判断这是否恰好是连续3个涨停。
-    if len(daily_data) < 4:
+def is_consecutive_rise_with_increasing_volume(daily_data, days=3, reference_days=10, baseline_ratio=1.15):
+    """确认连续上涨、成交量逐日不下降，且短期均量明显高于此前基准。"""
+    required_columns = {"pct_chg", "vol"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < days + reference_days:
         return False
-    recent_rows = daily_data.iloc[-3:]
-    previous_row = daily_data.iloc[-4]
-    return all(is_limit_up_row(row, ts_code) for _, row in recent_rows.iterrows()) and not is_limit_up_row(previous_row, ts_code)
-
-
-def is_rising_with_volume_increase(daily_data, days=3):
-    """
-    判断是否连续n天上涨并且成交量逐步放大或与前一天相差不大（相差不超过10%）
-    """
-    # 确保有足够的天数进行判断
-    if len(daily_data) < days:
+    recent_change = pd.to_numeric(daily_data["pct_chg"].iloc[-days:], errors="coerce")
+    recent_volume = pd.to_numeric(daily_data["vol"].iloc[-days:], errors="coerce")
+    reference_volume = pd.to_numeric(
+        daily_data["vol"].iloc[-(days + reference_days):-days], errors="coerce"
+    ).mean()
+    if recent_change.isna().any() or recent_volume.isna().any() or pd.isna(reference_volume) or reference_volume <= 0:
         return False
-    is_consecutive_rise = all(daily_data['pct_chg'].iloc[-days:] > 0)
-    if is_consecutive_rise:
-        vol_increase = all(daily_data['vol'].iloc[-i] >= daily_data['vol'].iloc[-i - 1] * 0.95
-                           for i in range(1, days))
-        return vol_increase
-    return False
+    volume_increasing = bool((recent_volume.diff().dropna() >= 0).all())
+    return bool((recent_change > 0).all() and volume_increasing and recent_volume.mean() >= reference_volume * baseline_ratio)
 
 
 def is_volume_surge_with_price_rise(daily_data, days=3, reference_days=7, volume_multiplier=3, consecutive_rise_days=2):
@@ -204,389 +172,281 @@ def is_volume_surge_with_price_rise(daily_data, days=3, reference_days=7, volume
     return False
 
 
-def is_capital_inflow(daily_data, min_threshold=0.90, days=3, reference_days=7, volume_increase_threshold=1.2):
-    """
-    判断是否存在明显的资金流入（主力资金吸筹）情况。
-
-    条件：
-    1. 过去days天的成交额不明显减少（相对于前一天减少不超过 min_threshold），并且股价涨幅为正。
-    2. 最近days天的成交额显著大于前reference_days天的平均成交额。
-
-    :param daily_data: 股票的每日数据
-    :param min_threshold: 成交额最低回落阈值，默认是0.9倍，即成交额最多减少10%
-    :param days: 连续天数，默认是3天
-    :param reference_days: 用于比较的参考天数，默认7天
-    :param volume_increase_threshold: 最近days天成交额相对于前reference_days天的放大倍数，默认1.2倍
-    :return: 如果满足条件返回True，否则返回False
-    """
-    # 确保有足够的天数进行判断
-    if len(daily_data) < days + reference_days:
+def is_consecutive_rise_with_amount_expansion(
+    daily_data,
+    days=3,
+    reference_days=10,
+    amount_ratio=1.2,
+    minimum_return=0.01,
+    maximum_return=0.15,
+):
+    """确认连续上涨且成交额高于此前基准，并过滤涨幅过弱或已经过热的标的。"""
+    required_columns = {"close", "pct_chg", "amount"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < days + reference_days + 1:
         return False
-
-    # 计算前reference_days天的平均成交额
-    reference_avg_amount = daily_data['amount'].iloc[-(days + reference_days):-days].mean()
-
-    # 计算最近days天的平均成交额
-    recent_avg_amount = daily_data['amount'].iloc[-days:].mean()
-
-    # 判断最近days天的成交额是否比前reference_days的平均成交额大很多
-    if recent_avg_amount < reference_avg_amount * volume_increase_threshold:
-        return False  # 最近days天的成交额没有显著增加，返回False
-
-    recent_data = daily_data.iloc[-days:]
-    if not all(recent_data['pct_chg'] > 0):
+    recent_change = pd.to_numeric(daily_data["pct_chg"].iloc[-days:], errors="coerce")
+    recent_amount = pd.to_numeric(daily_data["amount"].iloc[-days:], errors="coerce")
+    reference_amount = pd.to_numeric(
+        daily_data["amount"].iloc[-(days + reference_days):-days], errors="coerce"
+    ).mean()
+    close = pd.to_numeric(daily_data["close"], errors="coerce")
+    start_close, current_close = close.iloc[-days - 1], close.iloc[-1]
+    if recent_change.isna().any() or recent_amount.isna().any() or pd.isna(reference_amount) or reference_amount <= 0:
         return False
-    return all(
-        recent_data['amount'].iloc[index] >= recent_data['amount'].iloc[index - 1] * min_threshold
-        for index in range(1, len(recent_data))
-    )
-
-
-def is_stock_stabilizing(daily_data, days=5):
-    """
-    判断股票是否出现企稳迹象，但涨幅不大。5日线上穿10日线。
-
-    条件：
-    1. 价格在低点附近形成支撑并开始反弹，但涨幅不大（2% - 5%）。
-    2. 成交量在反弹期间出现放大。
-    3. 5日均线逐渐上穿10日均线。
-
-    :param daily_data: 股票的每日数据，包含'close'（收盘价）和'vol'（成交量）等字段
-    :param days: 判断的天数窗口，默认是最近5天
-    :return: True如果股票出现企稳迹象，False否则
-    """
-    # 确保有足够的天数进行判断，至少需要10天的价格数据来计算10日均线
-    if len(daily_data) < 10:
+    if pd.isna(start_close) or pd.isna(current_close) or start_close <= 0:
         return False
-
-    # 计算5日均线和10日均线
-    daily_data['MA5'] = daily_data['close'].rolling(window=5).mean()
-    daily_data['MA10'] = daily_data['close'].rolling(window=10).mean()
-
-    # 最近days天的5日均线和10日均线
-    # 最近窗口内必须实际发生“前一日不高于、当前日高于”的穿越。
-    crossover = (daily_data['MA5'] > daily_data['MA10']) & (daily_data['MA5'].shift(1) <= daily_data['MA10'].shift(1))
-    ma_crossover = bool(crossover.iloc[-days:].any())
-
-    # 1. 判断是否形成低点支撑（最近days天中，价格相对较低并开始反弹）
-    # 条件：当前的收盘价相对前几天的价格略有上涨，表明反弹初期
-    recent_prices = daily_data['close'].iloc[-days:]
-    lowest_price = recent_prices.min()
-    last_close_price = recent_prices.iloc[-1]
-
-    # 价格止跌反弹的条件：涨幅在2%到7%之间
-    price_rebound = (lowest_price * 1.02 <= last_close_price <= lowest_price * 1.07)
-
-    # 2. 判断成交量是否放大（最近几天成交量逐步增加）
-    recent_volumes = daily_data['vol'].iloc[-days:]
-    volume_increase = all(recent_volumes.iloc[-i] >= recent_volumes.iloc[-(i + 1)] * 0.90 for i in range(1, days))
-
-    # 综合判断条件：价格略有反弹，成交量放大，且5日均线上穿10日均线
-    if price_rebound and volume_increase and ma_crossover:
-        return True
-
-    return False
+    cumulative_return = current_close / start_close - 1.0
+    amount_expanded = recent_amount.mean() >= reference_amount * amount_ratio and recent_amount.iloc[-1] >= reference_amount * amount_ratio
+    return bool((recent_change > 0).all() and amount_expanded and minimum_return <= cumulative_return <= maximum_return)
 
 
-def is_stock_stabilizing_over60(daily_data, days=5, tolerance=0.05):
-    """
-    判断股票是否出现企稳迹象，并且反弹刚突破60日均线。
-
-    条件：
-    1. 价格在低点附近形成支撑并开始反弹，且刚刚突破60日均线（不超过5%）。
-    2. 成交量在反弹期间出现放大。
-
-    :param daily_data: 股票的每日数据，包含'close'（收盘价）和'vol'（成交量）等字段
-    :param days: 判断的天数窗口，默认是最近5天
-    :param tolerance: 股价突破60日均线的最大容差，默认不超过60日均线的5%。
-    :return: True如果股票出现企稳迹象，False否则
-    """
-    # 确保有足够的天数进行判断
-    if len(daily_data) < 61:  # 上一日和当前日都需要有效的60日均线
+def is_ma10_support_rebound(
+    daily_data,
+    touch_days=3,
+    touch_lower=0.98,
+    touch_upper=1.01,
+    rebound_buffer=0.005,
+    maximum_distance=0.05,
+    slope_days=3,
+):
+    """确认上升中的MA10附近回踩未有效跌破，并在最新交易日重新向上反弹。"""
+    if "close" not in daily_data.columns or len(daily_data) < 10 + slope_days:
         return False
-
-    # 计算60日均线
-    daily_data['ma60'] = daily_data['close'].rolling(window=60).mean()
-
-    # 获取最近days天的价格和成交量
-    recent_prices = daily_data['close'].iloc[-days:]
-    recent_ma60 = daily_data['ma60'].iloc[-days:]
-    last_close_price = recent_prices.iloc[-1]
-    last_ma60 = recent_ma60.iloc[-1]
-
-    # 必须从均线下方真实穿越到上方，而不是仅判断当前仍在均线上方。
-    previous_close = daily_data['close'].iloc[-2]
-    previous_ma60 = daily_data['ma60'].iloc[-2]
-    if pd.isna(previous_ma60) or pd.isna(last_ma60):
+    close = pd.to_numeric(daily_data["close"], errors="coerce")
+    low = pd.to_numeric(daily_data["low"], errors="coerce") if "low" in daily_data.columns else close
+    ma10 = close.rolling(10).mean()
+    if close.isna().any() or low.isna().any() or pd.isna(ma10.iloc[-1 - slope_days]):
         return False
-    if previous_close > previous_ma60 or last_close_price <= last_ma60:
+    if ma10.iloc[-1] <= ma10.iloc[-1 - slope_days]:
         return False
-
-    if last_close_price > last_ma60 * (1 + tolerance):
-        return False  # 如果股价已经大幅高于60日均线，则过滤掉
-
-    # 2. 判断成交量是否放大（最近几天成交量逐步增加）
-    recent_volumes = daily_data['vol'].iloc[-days:]
-    volume_increase = all(recent_volumes.iloc[i] >= recent_volumes.iloc[i - 1] * 0.90 for i in range(1, days))
-
-    # 如果价格刚突破60日均线并且成交量放大，则认为股票出现企稳迹象
-    if volume_increase:
-        return True
-
-    return False
+    recent_low = low.iloc[-touch_days:]
+    recent_close = close.iloc[-touch_days:]
+    recent_ma10 = ma10.iloc[-touch_days:]
+    touched_support = ((recent_low >= recent_ma10 * touch_lower) & (recent_low <= recent_ma10 * touch_upper)).any()
+    support_not_broken = (recent_close >= recent_ma10 * touch_lower).all()
+    current_close, current_ma10 = close.iloc[-1], ma10.iloc[-1]
+    rebound_confirmed = current_close > close.iloc[-2] and current_close > current_ma10 * (1.0 + rebound_buffer)
+    return bool(touched_support and support_not_broken and rebound_confirmed and current_close <= current_ma10 * (1.0 + maximum_distance))
 
 
-def is_macd_golden_cross(daily_data, short_window=12, long_window=26, signal_window=9, days=3):
-    """
-    判断最近几天是否出现MACD金叉。
-    """
-    if len(daily_data) < long_window:
+def is_volume_breakout_ma60(daily_data, breakout_buffer=0.005, maximum_distance=0.05, volume_ratio=1.2):
+    """确认最新交易日从下方放量突破MA60，并过滤长期位于均线上方或突破过远的情况。"""
+    required_columns = {"close", "vol"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < 63:
         return False
+    close = pd.to_numeric(daily_data["close"], errors="coerce")
+    volume = pd.to_numeric(daily_data["vol"], errors="coerce")
+    ma60 = close.rolling(60).mean()
+    if close.isna().any() or volume.isna().any() or pd.isna(ma60.iloc[-2]):
+        return False
+    previous_close, current_close = close.iloc[-2], close.iloc[-1]
+    previous_ma60, current_ma60 = ma60.iloc[-2], ma60.iloc[-1]
+    crossed = previous_close <= previous_ma60 and current_close > current_ma60 * (1.0 + breakout_buffer)
+    not_extended = current_close <= current_ma60 * (1.0 + maximum_distance)
+    prior_five_below = int((close.iloc[-6:-1] <= ma60.iloc[-6:-1]).sum()) >= 3
+    reference_volume = volume.iloc[-21:-1].mean()
+    volume_expanded = reference_volume > 0 and volume.iloc[-1] >= reference_volume * volume_ratio
+    return bool(crossed and not_extended and prior_five_below and current_close > previous_close and volume_expanded)
 
-    # 计算快线EMA
-    ema_short = daily_data['close'].ewm(span=short_window, adjust=False).mean()
-    # 计算慢线EMA
-    ema_long = daily_data['close'].ewm(span=long_window, adjust=False).mean()
-    # 计算DIF
+
+def _seeded_ema(values, period):
+    """使用首个周期的简单平均值作为种子，避免短样本从首个价格直接启动EMA。"""
+    numeric = pd.to_numeric(values, errors="coerce").reset_index(drop=True).astype(float)
+    result = pd.Series(float("nan"), index=numeric.index, dtype=float)
+    if period <= 0 or len(numeric) < period or numeric.isna().any():
+        return result
+    seed_index = period - 1
+    result.iloc[seed_index] = numeric.iloc[:period].mean()
+    alpha = 2.0 / (period + 1.0)
+    for index in range(seed_index + 1, len(numeric)):
+        result.iloc[index] = numeric.iloc[index] * alpha + result.iloc[index - 1] * (1.0 - alpha)
+    return result
+
+
+def calculate_macd(daily_data, short_window=12, long_window=26, signal_window=9):
+    """按通行的12/26/9参数计算DIF、DEA和柱值，输出与输入行一一对应。"""
+    close = daily_data["close"].reset_index(drop=True)
+    ema_short = _seeded_ema(close, short_window)
+    ema_long = _seeded_ema(close, long_window)
     dif = ema_short - ema_long
-    # 计算DEA
-    dea = dif.ewm(span=signal_window, adjust=False).mean()
-    # 计算MACD
-    macd = 2 * (dif - dea)
-
-    # 判断金叉
-    for i in range(1, days + 1):
-        if macd.iloc[-i - 1] < 0 < macd.iloc[-i]:
-            return True
-
-    return False
+    valid_dif = dif.dropna()
+    dea = pd.Series(float("nan"), index=dif.index, dtype=float)
+    if not valid_dif.empty:
+        seeded_dea = _seeded_ema(valid_dif.reset_index(drop=True), signal_window)
+        dea.loc[valid_dif.index] = seeded_dea.to_numpy()
+    return pd.DataFrame({"dif": dif, "dea": dea, "histogram": 2.0 * (dif - dea)})
 
 
-def is_macd_golden_cross_7(daily_data, short_window=12, long_window=26, signal_window=9, max_price_change=0.05,
-                                recent_days=7):
-    """
-    判断最近几天（如7天内）是否出现MACD金叉并且涨幅不大。
-    :param daily_data: 股票的每日数据，必须包含'close'列。
-    :param short_window: MACD的短期均线窗口，默认12天。
-    :param long_window: MACD的长期均线窗口，默认26天。
-    :param signal_window: 信号线的窗口，默认9天。
-    :param max_price_change: 限制价格涨幅的阈值，默认是5%。
-    :param recent_days: 定义在最近多少天内寻找金叉，默认7天。
-    :return: 如果最近几天出现金叉并且涨幅不大，返回True，否则返回False。
-    """
-    # 确保有足够的天数进行判断
-    if len(daily_data) < long_window + recent_days:
+def is_macd_golden_cross(daily_data, short_window=12, long_window=26, signal_window=9, recent_days=3):
+    """判断最近交易日内DIF是否从不高于DEA转为高于DEA。"""
+    minimum_rows = long_window + signal_window
+    if "close" not in daily_data.columns or len(daily_data) < minimum_rows:
         return False
-
-    # 计算短期均线和长期均线
-    ema_short = daily_data['close'].ewm(span=short_window, adjust=False).mean()
-    ema_long = daily_data['close'].ewm(span=long_window, adjust=False).mean()
-
-    # 计算MACD线
-    macd_line = ema_short - ema_long
-
-    # 计算信号线
-    signal_line = macd_line.ewm(span=signal_window, adjust=False).mean()
-
-    # 检查MACD线和信号线的差值（即柱状图）
-    macd_histogram = macd_line - signal_line
-
-    # 检查MACD金叉并且价格涨幅不大
-    if len(macd_histogram) < recent_days + 1:
-        return False
-
-    for i in range(-recent_days, 0):
-        if macd_histogram.iloc[i - 1] < 0 < macd_histogram.iloc[i]:
-            # MACD金叉发生时，检查涨幅是否在设定的范围内
-            price_change = (daily_data['close'].iloc[i] - daily_data['close'].iloc[i - 1]) / daily_data['close'].iloc[
-                i - 1]
-            if price_change <= max_price_change:
-                return True
-
-    return False
+    macd = calculate_macd(daily_data, short_window, long_window, signal_window)
+    spread = macd["dif"] - macd["dea"]
+    golden_cross = (spread > 0) & (spread.shift(1) <= 0)
+    return bool(golden_cross.tail(max(1, recent_days)).fillna(False).any())
 
 
-def is_double_bottom(daily_data, min_days_between=5, max_days_between=30):
-    """
-    检测双底结构：
-    1. 第一个低点
-    2. 反弹到颈线位置
-    3. 第二个低点（成交量较第一底小）
-    4. 突破颈线确认
-    
-    参数：
-    - daily_data: DataFrame，股票日线数据
-    - min_days_between: int，两底之间的最小天数
-    - max_days_between: int，两底之间的最大天数
-    """
-    if len(daily_data) < 30:
-        return False
-
-    recent_data = get_recent_days_data(daily_data, days=90)
-    recent_data = recent_data.reset_index(drop=True)
-
-    # 找到第一个低点
-    min1_idx = recent_data['close'].idxmin()
-    min1_price = recent_data['close'].iloc[min1_idx]
-    min1_volume = recent_data['vol'].iloc[min1_idx]
-
-    # 找到第一个低点后的反弹高点（颈线位置）
-    after_min1_data = recent_data.iloc[min1_idx + 1:]
-    if after_min1_data.empty:
-        return False
-
-    max_between_idx = after_min1_data['close'].idxmax()
-    neckline_price = recent_data['close'].iloc[max_between_idx]
-
-    # 找到第二个低点
-    after_max_data = recent_data.iloc[max_between_idx + 1:]
-    if after_max_data.empty:
-        return False
-
-    min2_idx = after_max_data['close'].idxmin()
-    min2_price = recent_data['close'].iloc[min2_idx]
-    min2_volume = recent_data['vol'].iloc[min2_idx]
-
-    # 检查条件
-    days_between = min2_idx - min1_idx
-    price_diff_percent = abs(min2_price - min1_price) / min1_price
-    
-    conditions = [
-        min_days_between <= days_between <= max_days_between,  # 时间间隔合适
-        price_diff_percent <= 0.05,  # 两个底部价格相差不超过5%
-        min2_volume < min1_volume,  # 第二底成交量小于第一底
-        min2_idx > max_between_idx,  # 确保时间顺序正确
-        neckline_price > min1_price * 1.05  # 颈线至少比底部高5%
-    ]
-
-    if all(conditions):
-        # 检查突破颈线确认
-        after_min2_data = recent_data.iloc[min2_idx + 1:]
-        if not after_min2_data.empty:
-            # 检查是否突破颈线位置的90%
-            breakout_price = neckline_price * 0.9
-            if any(after_min2_data['close'] >= breakout_price):
-                # 确认突破时的成交量是否放大
-                breakout_idx = after_min2_data[after_min2_data['close'] >= breakout_price].index[0]
-                breakout_volume = recent_data['vol'].iloc[breakout_idx]
-                avg_volume = recent_data['vol'].iloc[min2_idx-5:min2_idx].mean()
-                
-                if breakout_volume > avg_volume * 1.2:  # 突破时成交量至少放大20%
-                    return True
-
-    return False
-
-
-def is_breakout_after_consolidation(daily_data, consolidation_days=30, recent_days=5, price_threshold=0.05,
-                                    volume_increase_threshold=1.2):
-    """
-    判断股票是否在横盘期后出现放量上涨。
-
-    :param daily_data: 股票的每日数据（DataFrame）
-    :param consolidation_days: 横盘期的天数，默认是30天
-    :param recent_days: 检查最近几天内的表现，默认是5天
-    :param price_threshold: 检查横盘期股价波动的阈值，默认是5%
-    :param volume_increase_threshold: 成交量放大的阈值，默认是1.2倍
-    :return: 如果满足横盘期后的放量上涨条件，返回True，否则返回False
-    """
-    if len(daily_data) < consolidation_days + recent_days:
-        return False
-
-    # 获取横盘期和最近几天的数据
-    consolidation_data = daily_data.iloc[-(consolidation_days + recent_days):-recent_days]
-    recent_data = daily_data.iloc[-recent_days:]
-
-    # 1. 检查横盘期内股价波动是否很小（最高价和最低价相差小于 price_threshold）
-    max_price = consolidation_data['close'].max()
-    min_price = consolidation_data['close'].min()
-    price_range = (max_price - min_price) / min_price
-
-    if price_range > price_threshold:
-        return False  # 如果股价波动超过阈值，认为没有横盘
-
-    # 2. 检查最近几天股价是否出现轻微上涨
-    recent_price_change = (recent_data['close'].iloc[-1] - recent_data['close'].iloc[0]) / recent_data['close'].iloc[0]
-    if recent_price_change <= 0:
-        return False  # 如果没有出现上涨
-
-    # 3. 检查最近几天成交量是否有明显放大
-    avg_volume_consolidation = consolidation_data['vol'].mean()
-    avg_volume_recent = recent_data['vol'].mean()
-
-    if avg_volume_recent < avg_volume_consolidation * volume_increase_threshold:
-        return False  # 如果成交量放大不足
-
-    # 如果满足横盘期后的放量上涨条件，返回True
-    return True
-
-
-def is_upward_trend(daily_data):
-    """
-    检测股票是否处于上涨初期：
-    1. 突破阻力位
-    2. 低位放量上涨
-    3. MACD金叉
-    """
-    # 确保有足够数据
-    if len(daily_data) < 61:
-        return False
-
-    # 1. 检查是否刚刚突破阻力位（如均线）
-    short_ma = daily_data['close'].rolling(window=5).mean()
-    long_ma = daily_data['close'].rolling(window=60).mean()
-
-    # 最近一天5日均线突破60日均线
-    if short_ma.iloc[-1] > long_ma.iloc[-1] and short_ma.iloc[-2] <= long_ma.iloc[-2]:
-        # 2. 检查低位放量上涨
-        if is_volume_surge_with_price_rise(daily_data, days=4):
-            # 3. MACD金叉
-            if is_macd_golden_cross(daily_data):
-                return True
-
-    return False
-
-
-def is_double_bottom_new(daily_data, window=10, price_diff=0.05, min_days=5, max_days=30, volume_ratio=1.2):
-    """
-    检测双底结构：
-    1. 两个低点价格接近，间隔合适
-    2. 第二底成交量小于第一底
-    3. 反弹突破颈线且放量
-    """
-    if len(daily_data) < window * 3:
-        return False
-
-    closes = daily_data['close'].values
-    vols = daily_data['vol'].values
+def _local_bottom_indices(prices, radius):
+    """识别唯一局部低点，平台型低点不重复生成多个候选。"""
     bottoms = []
-    # 1. 用滑动窗口找局部低点
-    for i in range(window, len(closes) - window):
-        window_slice = closes[i - window:i + window + 1]
-        if closes[i] == window_slice.min():
-            bottoms.append(i)
-    # 2. 检查所有可能的双底组合
-    for i in range(len(bottoms) - 1):
-        idx1, idx2 = bottoms[i], bottoms[i + 1]
-        if not (min_days <= idx2 - idx1 <= max_days):
-            continue
-        price1, price2 = closes[idx1], closes[idx2]
-        if abs(price1 - price2) / price1 > price_diff:
-            continue
-        # 颈线
-        neckline = closes[idx1:idx2].max()
-        vol1, vol2 = vols[idx1], vols[idx2]
-        if vol2 >= vol1:
-            continue
-        # 3. 突破颈线且放量
-        after_idx2 = daily_data.iloc[idx2 + 1:]
-        breakout = after_idx2[after_idx2['close'] > neckline]
-        if not breakout.empty:
-            breakout_idx = breakout.index[0]
-            breakout_vol = daily_data.loc[breakout_idx, 'vol']
-            avg_vol = daily_data['vol'].iloc[max(0, idx2 - 5):idx2].mean()
-            if breakout_vol > avg_vol * volume_ratio:
-                return True
+    for index in range(radius, len(prices) - radius):
+        window = prices.iloc[index - radius:index + radius + 1]
+        center = prices.iloc[index]
+        if pd.notna(center) and center == window.min() and int((window == center).sum()) == 1:
+            bottoms.append(index)
+    return bottoms
+
+
+def is_double_bottom(
+    daily_data,
+    local_window=3,
+    min_days_between=10,
+    max_days_between=60,
+    price_tolerance=0.05,
+    min_rebound_ratio=0.05,
+    volume_ratio=1.2,
+    confirmation_days=3,
+    max_breakout_wait=30,
+    lookback_days=120,
+):
+    """按双局部低点、颈线反弹和最近放量突破三个阶段确认双底。"""
+    required_columns = {"close", "vol"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < min_days_between + local_window * 2 + 2:
+        return False
+    data = daily_data.tail(lookback_days).reset_index(drop=True).copy()
+    close = pd.to_numeric(data["close"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce") if "low" in data.columns else close
+    high = pd.to_numeric(data["high"], errors="coerce") if "high" in data.columns else close
+    volume = pd.to_numeric(data["vol"], errors="coerce")
+    if close.isna().any() or low.isna().any() or high.isna().any() or volume.isna().any():
+        return False
+
+    bottoms = _local_bottom_indices(low, local_window)
+    recent_confirmation_start = max(1, len(data) - max(1, confirmation_days))
+    for first_position, first_index in enumerate(bottoms[:-1]):
+        for second_index in bottoms[first_position + 1:]:
+            days_between = second_index - first_index
+            if days_between > max_days_between:
+                break
+            if days_between < min_days_between:
+                continue
+            first_price, second_price = low.iloc[first_index], low.iloc[second_index]
+            if first_price <= 0 or abs(second_price - first_price) / first_price > price_tolerance:
+                continue
+            neckline = high.iloc[first_index + 1:second_index].max()
+            average_bottom = (first_price + second_price) / 2.0
+            if pd.isna(neckline) or neckline < average_bottom * (1.0 + min_rebound_ratio):
+                continue
+            first_bottom_volume = volume.iloc[max(0, first_index - 1):first_index + 2].mean()
+            second_bottom_volume = volume.iloc[max(0, second_index - 1):second_index + 2].mean()
+            if second_bottom_volume > first_bottom_volume:
+                continue
+            confirmation_start = max(second_index + 1, recent_confirmation_start)
+            for breakout_index in range(confirmation_start, len(data)):
+                if breakout_index - second_index > max_breakout_wait or close.iloc[breakout_index] <= neckline:
+                    continue
+                reference_volume = volume.iloc[max(0, breakout_index - 20):breakout_index].mean()
+                if reference_volume > 0 and volume.iloc[breakout_index] >= reference_volume * volume_ratio:
+                    return True
     return False
+
+
+def is_breakout_after_consolidation(
+    daily_data,
+    consolidation_days=30,
+    recent_days=5,
+    price_threshold=0.05,
+    volume_increase_threshold=1.2,
+    breakout_buffer=0.005,
+):
+    """确认最近窗口内放量上穿横盘上沿，且最新收盘仍处于上沿之上。"""
+    required_columns = {"close", "vol"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < consolidation_days + recent_days:
+        return False
+
+    consolidation_data = daily_data.iloc[-(consolidation_days + recent_days):-recent_days].copy()
+    recent_data = daily_data.iloc[-recent_days:].copy()
+    consolidation_close = pd.to_numeric(consolidation_data["close"], errors="coerce")
+    recent_close = pd.to_numeric(recent_data["close"], errors="coerce")
+    recent_volume = pd.to_numeric(recent_data["vol"], errors="coerce")
+    if consolidation_close.isna().any() or recent_close.isna().any() or recent_volume.isna().any():
+        return False
+
+    # 收盘价用于判断横盘稳定性；若有最高价字段，则用区间最高价作为更严格的突破上沿。
+    max_price = consolidation_close.max()
+    min_price = consolidation_close.min()
+    if min_price <= 0:
+        return False
+    price_range = (max_price - min_price) / min_price
+    if price_range > price_threshold:
+        return False
+    if "high" in consolidation_data.columns:
+        resistance = pd.to_numeric(consolidation_data["high"], errors="coerce").max()
+    else:
+        resistance = max_price
+    average_volume = pd.to_numeric(consolidation_data["vol"], errors="coerce").mean()
+    if pd.isna(resistance) or pd.isna(average_volume) or average_volume <= 0:
+        return False
+
+    breakout_level = resistance * (1.0 + breakout_buffer)
+    previous_close = consolidation_close.iloc[-1]
+    breakout_confirmed = False
+    for current_close, current_volume in zip(recent_close, recent_volume):
+        crossed_resistance = previous_close <= breakout_level < current_close
+        if crossed_resistance and current_volume >= average_volume * volume_increase_threshold:
+            breakout_confirmed = True
+        previous_close = current_close
+    # 突破后跌回横盘上沿下方属于失败突破，不继续保留信号。
+    return breakout_confirmed and recent_close.iloc[-1] > resistance
+
+
+def calculate_upward_trend_score(daily_data):
+    """计算上涨初期5项评分；位置约束不计分，但决定最终是否命中。"""
+    empty_result = {"matched": False, "score": 0, "total_score": 5, "reasons": [], "metrics": {}}
+    required_columns = {"close", "vol"}
+    if not required_columns.issubset(daily_data.columns) or len(daily_data) < 61:
+        return empty_result
+    close = pd.to_numeric(daily_data["close"], errors="coerce")
+    volume = pd.to_numeric(daily_data["vol"], errors="coerce")
+    if close.isna().any() or volume.isna().any():
+        return empty_result
+
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+    macd = calculate_macd(pd.DataFrame({"close": close}))
+    histogram = macd["histogram"]
+    current_close, current_ma20 = close.iloc[-1], ma20.iloc[-1]
+    volume_reference = volume.iloc[-20:].mean()
+    volume_ratio = volume.iloc[-5:].mean() / volume_reference if volume_reference > 0 else 0.0
+    return_20d = current_close / close.iloc[-21] - 1.0 if close.iloc[-21] > 0 else float("nan")
+    ma20_distance = current_close / current_ma20 - 1.0 if current_ma20 > 0 else float("nan")
+
+    conditions = (
+        (ma5.iloc[-1] > ma10.iloc[-1] and ma5.iloc[-1] > ma5.iloc[-4], "MA5位于MA10上方且保持上行"),
+        (ma10.iloc[-1] > ma10.iloc[-6], "MA10趋势向上"),
+        (
+            macd["dif"].iloc[-1] > macd["dea"].iloc[-1] and histogram.iloc[-1] > histogram.iloc[-2] > histogram.iloc[-3],
+            "MACD位于金叉状态且动能连续增强",
+        ),
+        (volume_ratio >= 1.10, "近5日成交量高于20日均量"),
+        (pd.notna(return_20d) and 0.03 <= return_20d <= 0.15, "20日涨幅处于3%至15%"),
+    )
+    score = sum(bool(matched) for matched, _ in conditions)
+    position_confirmed = pd.notna(ma20_distance) and 0 < ma20_distance <= 0.08
+    reasons = [reason for matched, reason in conditions if matched]
+    if position_confirmed:
+        reasons.insert(0, "收盘价位于MA20上方且偏离不超过8%")
+    metrics = {
+        "close": round(float(current_close), 4),
+        "ma20": round(float(current_ma20), 4),
+        "ma20_distance_pct": round(float(ma20_distance * 100), 2),
+        "volume_ratio_5_20": round(float(volume_ratio), 2),
+        "return_20d_pct": round(float(return_20d * 100), 2),
+    }
+    return {"matched": bool(position_confirmed and score >= 4), "score": score, "total_score": 5, "reasons": reasons, "metrics": metrics}
 
 
 def is_funds_inflow_by_volume_turnover(daily_data, n=7, m=30, ratio=1.2, pct_positive=0.66):
