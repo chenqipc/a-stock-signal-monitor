@@ -11,11 +11,13 @@ from market_data.error_classifier import classify_scan_error
 
 
 KLINE_COLUMNS = [
-    "trade_time", "open", "close", "high", "low", "vol", "amount", "pre_close", "pct_chg", "turnover_rate", "is_st"
+    "trade_time", "open", "close", "high", "low", "vol", "amount", "pre_close", "pct_chg", "turnover_rate", "is_st", "ma10", "ma30", "ma60"
 ]
+KLINE_MA_COLUMNS = ("ma10", "ma30", "ma60")
 ASSET_TABLES = {"stock": "stock_master", "etf": "etf_master"}
 TASK_TYPE_MARKET_SCAN = "market_scan"
 TASK_TYPE_ERROR_RETRY = "error_retry"
+MINUTE_MA_REQUIRED_BARS = 62
 
 
 class MarketDataDatabase:
@@ -61,11 +63,15 @@ class MarketDataDatabase:
                     pct_chg REAL,
                     turnover_rate REAL,
                     is_st INTEGER,
+                    ma10 REAL,
+                    ma30 REAL,
+                    ma60 REAL,
                     source TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, period, trade_time)
                 );
                 CREATE INDEX IF NOT EXISTS idx_kline_query ON kline(symbol, period, trade_time);
+                CREATE INDEX IF NOT EXISTS idx_kline_period_time ON kline(period, trade_time);
                 CREATE TABLE IF NOT EXISTS fetch_state (
                     symbol TEXT NOT NULL,
                     period TEXT NOT NULL,
@@ -124,6 +130,47 @@ class MarketDataDatabase:
                     FOREIGN KEY(group_id) REFERENCES instrument_group(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_group_item_order ON instrument_group_item(group_id, is_pinned, pinned_at, added_at);
+                CREATE TABLE IF NOT EXISTS realtime_monitor_instrument (
+                    symbol TEXT PRIMARY KEY,
+                    asset_type TEXT NOT NULL CHECK(asset_type IN ('stock', 'etf')),
+                    name TEXT NOT NULL,
+                    added_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS realtime_signal_state (
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    asset_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    bar_time TEXT,
+                    close REAL,
+                    ma10 REAL,
+                    ma30 REAL,
+                    ma60 REAL,
+                    cross_ma10 TEXT,
+                    cross_ma30 TEXT,
+                    cross_ma60 TEXT,
+                    above_all INTEGER NOT NULL DEFAULT 0,
+                    source TEXT,
+                    error_message TEXT,
+                    evaluated_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol, period),
+                    FOREIGN KEY(symbol) REFERENCES realtime_monitor_instrument(symbol) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS realtime_signal_event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    bar_time TEXT NOT NULL,
+                    ma_window INTEGER NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('up', 'down')),
+                    close REAL NOT NULL,
+                    ma_value REAL NOT NULL,
+                    source TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(symbol, period, bar_time, ma_window, direction)
+                );
+                CREATE INDEX IF NOT EXISTS idx_realtime_event_symbol_time
+                ON realtime_signal_event(symbol, bar_time DESC);
                 CREATE TABLE IF NOT EXISTS scan_run (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_type TEXT NOT NULL DEFAULT 'market_scan',
@@ -177,6 +224,9 @@ class MarketDataDatabase:
             self._ensure_column(connection, "scan_run", "parent_run_id", "INTEGER")
             self._ensure_column(connection, "stock_signal", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
             self._ensure_column(connection, "scan_error", "asset_type", "TEXT NOT NULL DEFAULT 'stock'")
+            self._ensure_column(connection, "kline", "ma10", "REAL")
+            self._ensure_column(connection, "kline", "ma30", "REAL")
+            self._ensure_column(connection, "kline", "ma60", "REAL")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_scan_run_task_type ON scan_run(task_type, id DESC)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_stock_signal_asset ON stock_signal(run_id, asset_type, signal_type)")
 
@@ -233,10 +283,14 @@ class MarketDataDatabase:
         for _, row in data.iterrows():
             values = [self._value_or_none(row.get(column)) for column in KLINE_COLUMNS]
             rows.append((symbol, period, *values, source, updated_at))
-        placeholders = ",".join("?" for _ in range(15))
+        placeholders = ",".join("?" for _ in range(len(KLINE_COLUMNS) + 4))
         columns = "symbol,period," + ",".join(KLINE_COLUMNS) + ",source,updated_at"
-        updates = ",".join(f"{column}=excluded.{column}" for column in KLINE_COLUMNS[1:] + ["source", "updated_at"])
-        sql = f"INSERT INTO kline ({columns}) VALUES ({placeholders}) ON CONFLICT(symbol,period,trade_time) DO UPDATE SET {updates}"
+        value_columns = [column for column in KLINE_COLUMNS[1:] if column not in KLINE_MA_COLUMNS]
+        updates = [f"{column}=excluded.{column}" for column in value_columns + ["source", "updated_at"]]
+        # 原始行情通常不含均线值，重复拉取K线时不能覆盖已经计算并持久化的均线。
+        updates.extend(f"{column}=COALESCE(excluded.{column},kline.{column})" for column in KLINE_MA_COLUMNS)
+        update_sql = ",".join(updates)
+        sql = f"INSERT INTO kline ({columns}) VALUES ({placeholders}) ON CONFLICT(symbol,period,trade_time) DO UPDATE SET {update_sql}"
         with self._connect() as connection:
             connection.executemany(sql, rows)
             connection.execute(
@@ -254,6 +308,30 @@ class MarketDataDatabase:
                         THEN excluded.coverage_end ELSE fetch_state.coverage_end END
                 """,
                 (symbol, period, source, updated_at, coverage_start, coverage_end),
+            )
+
+    def save_kline_moving_averages(self, symbol, period, data):
+        """保存完整计算窗口产生的均线，原始分钟K线裁剪后仍可直接绘制MA30/MA60。"""
+        if data is None or data.empty:
+            return
+        required_columns = {"trade_time", "MA10", "MA30", "MA60"}
+        if not required_columns.issubset(data.columns):
+            raise ValueError("均线数据缺少 trade_time、MA10、MA30 或 MA60")
+        rows = [
+            (
+                self._value_or_none(row["MA10"]),
+                self._value_or_none(row["MA30"]),
+                self._value_or_none(row["MA60"]),
+                symbol,
+                period,
+                self._value_or_none(row["trade_time"]),
+            )
+            for _, row in data.iterrows()
+        ]
+        with self._connect() as connection:
+            connection.executemany(
+                "UPDATE kline SET ma10 = ?, ma30 = ?, ma60 = ? WHERE symbol = ? AND period = ? AND trade_time = ?",
+                rows,
             )
 
     @staticmethod
@@ -283,6 +361,47 @@ class MarketDataDatabase:
         if not data.empty:
             data["trade_time"] = pd.to_datetime(data["trade_time"])
         return data
+
+    def prune_minute_klines(self, retention_days, now=None):
+        """按交易日清理分钟线，并保留61根完整K线及一根可能正在形成的K线。"""
+        retention_days = max(2, int(retention_days))
+        with self._connect() as connection:
+            changes_before = connection.total_changes
+            # 旧版本可能保存10:30或14:00的半根120分钟K线，清理后只保留完整上午、下午收盘点。
+            connection.execute(
+                "DELETE FROM kline WHERE period = '120min' AND substr(trade_time, 12, 5) NOT IN ('11:30', '15:00')"
+            )
+            connection.execute(
+                """
+                WITH ranked_minute_bars AS (
+                    SELECT rowid AS target_rowid,
+                           DENSE_RANK() OVER (
+                               PARTITION BY symbol, period ORDER BY date(trade_time) DESC
+                           ) AS trading_day_rank,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY symbol, period ORDER BY trade_time DESC
+                           ) AS bar_rank
+                    FROM kline
+                    WHERE period != 'D'
+                )
+                DELETE FROM kline
+                WHERE rowid IN (
+                    SELECT target_rowid FROM ranked_minute_bars WHERE trading_day_rank > ? AND bar_rank > ?
+                )
+                """,
+                (retention_days, MINUTE_MA_REQUIRED_BARS),
+            )
+            deleted = connection.total_changes - changes_before
+            connection.execute(
+                """
+                DELETE FROM fetch_state
+                WHERE period != 'D' AND NOT EXISTS (
+                    SELECT 1 FROM kline
+                    WHERE kline.symbol = fetch_state.symbol AND kline.period = fetch_state.period
+                )
+                """
+            )
+        return max(0, deleted)
 
     @staticmethod
     def _exclusive_end(end_date):
@@ -437,6 +556,146 @@ class MarketDataDatabase:
         """分页检索ETF主数据，并在自定义分组中优先返回置顶条目。"""
         return self._search_instruments("etf", query, market, page, page_size, group_id)
 
+    def add_realtime_monitor(self, symbol, asset_type="etf"):
+        """将主数据中的证券加入实时监控池；当前Web入口仅开放ETF。"""
+        normalized_type = self._normalize_asset_type(asset_type)
+        normalized_symbol = str(symbol or "").strip().upper()
+        table = self._asset_table(normalized_type)
+        with self._connect() as connection:
+            instrument = connection.execute(
+                f"SELECT ts_code, name FROM {table} WHERE ts_code = ?", (normalized_symbol,)
+            ).fetchone()
+            if not instrument:
+                raise ValueError("证券不存在于对应主列表")
+            connection.execute(
+                """
+                INSERT INTO realtime_monitor_instrument(symbol, asset_type, name, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET asset_type=excluded.asset_type, name=excluded.name
+                """,
+                (normalized_symbol, normalized_type, instrument["name"], self._utc_now()),
+            )
+        return self.get_realtime_monitor(normalized_symbol)
+
+    def get_realtime_monitor(self, symbol):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT symbol, asset_type, name, added_at FROM realtime_monitor_instrument WHERE symbol = ?",
+                (str(symbol or "").strip().upper(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_realtime_monitors(self, asset_type=None):
+        conditions = "WHERE asset_type = ?" if asset_type else ""
+        params = (self._normalize_asset_type(asset_type),) if asset_type else ()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT symbol, asset_type, name, added_at
+                FROM realtime_monitor_instrument {conditions}
+                ORDER BY added_at, symbol
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove_realtime_monitor(self, symbol):
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM realtime_monitor_instrument WHERE symbol = ?",
+                (str(symbol or "").strip().upper(),),
+            )
+        return cursor.rowcount > 0
+
+    def get_realtime_signal_states(self, symbols=None):
+        conditions = ""
+        params = []
+        if symbols:
+            normalized = [str(symbol).strip().upper() for symbol in symbols]
+            placeholders = ",".join("?" for _ in normalized)
+            conditions = f"WHERE symbol IN ({placeholders})"
+            params.extend(normalized)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM realtime_signal_state {conditions} ORDER BY symbol, period", params
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_realtime_signal_state(self, monitor, period, snapshot, source):
+        """保存周期最新状态，并对真实穿越事件进行幂等落库。"""
+        evaluated_at = self._utc_now()
+        symbol = monitor["symbol"]
+        crosses = snapshot["crosses"]
+        values = (
+            symbol,
+            period,
+            monitor["asset_type"],
+            monitor["name"],
+            str(snapshot["bar_time"]),
+            snapshot["close"],
+            snapshot["ma_values"][10],
+            snapshot["ma_values"][30],
+            snapshot["ma_values"][60],
+            crosses[10],
+            crosses[30],
+            crosses[60],
+            int(snapshot["above_all"]),
+            source,
+            None,
+            evaluated_at,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO realtime_signal_state(
+                    symbol, period, asset_type, name, bar_time, close, ma10, ma30, ma60,
+                    cross_ma10, cross_ma30, cross_ma60, above_all, source, error_message, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, period) DO UPDATE SET
+                    asset_type=excluded.asset_type, name=excluded.name, bar_time=excluded.bar_time,
+                    close=excluded.close, ma10=excluded.ma10, ma30=excluded.ma30, ma60=excluded.ma60,
+                    cross_ma10=excluded.cross_ma10, cross_ma30=excluded.cross_ma30,
+                    cross_ma60=excluded.cross_ma60, above_all=excluded.above_all,
+                    source=excluded.source, error_message=NULL, evaluated_at=excluded.evaluated_at
+                """,
+                values,
+            )
+            for window, direction in crosses.items():
+                if direction not in {"up", "down"}:
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO realtime_signal_event(
+                        symbol, period, bar_time, ma_window, direction, close, ma_value, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (symbol, period, str(snapshot["bar_time"]), window, direction, snapshot["close"], snapshot["ma_values"][window], source, evaluated_at),
+                )
+
+    def save_realtime_signal_error(self, monitor, period, error_message):
+        evaluated_at = self._utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO realtime_signal_state(symbol, period, asset_type, name, error_message, evaluated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, period) DO UPDATE SET
+                    name=excluded.name, error_message=excluded.error_message, evaluated_at=excluded.evaluated_at
+                """,
+                (monitor["symbol"], period, monitor["asset_type"], monitor["name"], str(error_message), evaluated_at),
+            )
+
+    def get_realtime_signal_events(self, symbol=None, limit=100):
+        """读取已持久化的均线穿越事件，供后续历史信号面板复用。"""
+        conditions = "WHERE symbol = ?" if symbol else ""
+        params = [str(symbol).strip().upper()] if symbol else []
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM realtime_signal_event {conditions} ORDER BY bar_time DESC, id DESC LIMIT ?",
+                [*params, min(1000, max(1, int(limit)))],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def _search_instruments(self, asset_type, query, market, page, page_size, group_id):
         table = self._asset_table(asset_type)
         conditions = []
@@ -461,13 +720,19 @@ class MarketDataDatabase:
                 query_params = [int(group_id), *params]
             list_date = "m.list_date" if asset_type == "stock" else "'' AS list_date"
             pin_column = "gi.is_pinned" if group_id is not None else "0 AS is_pinned"
+            monitor_column = (
+                "EXISTS(SELECT 1 FROM realtime_monitor_instrument r WHERE r.symbol = m.ts_code) AS is_monitored"
+                if asset_type == "etf"
+                else "0 AS is_monitored"
+            )
             order_clause = "gi.is_pinned DESC, gi.pinned_at DESC, gi.added_at DESC, m.ts_code" if group_id else "m.ts_code"
             total = connection.execute(
                 f"SELECT COUNT(*) FROM {table} m {join_clause} {where_clause}", query_params
             ).fetchone()[0]
             rows = connection.execute(
                 f"""
-                SELECT m.ts_code, m.symbol, m.name, m.market, {list_date}, m.source, m.updated_at, {pin_column}
+                SELECT m.ts_code, m.symbol, m.name, m.market, {list_date}, m.source, m.updated_at,
+                       {pin_column}, {monitor_column}
                 FROM {table} m {join_clause} {where_clause}
                 ORDER BY {order_clause} LIMIT ? OFFSET ?
                 """,

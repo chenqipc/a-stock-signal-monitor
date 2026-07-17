@@ -1,18 +1,28 @@
 """遍历股票列表并按策略状态输出结果。"""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
+from dataclasses import dataclass
+from typing import Optional, TextIO
 
-from common.StockEnum import StockStatus
+import pandas as pd
+
+from infrastructure.logging import configure_application_logging
 from market_data.config import RESOURCE_DIR, SCAN_CACHED_WORKERS
 from market_data.service import MarketDataService
 
-from .stock_strategy import daily_check, daily_strategy_window
+from .stock_status import StockStatus
+from .stock_strategy import daily_strategy_window, evaluate_daily_strategies
+
+
+logger = logging.getLogger(__name__)
 
 
 def scan_market(service=None, control=None, asset_type=None):
     """使用免费行情源和SQLite增量缓存扫描全部标的或指定资产类型。"""
+    configure_application_logging()
     scan_scope = normalize_scan_scope(asset_type)
     RESOURCE_DIR.mkdir(parents=True, exist_ok=True)
     # 新版本不再生成“不符合条件”文件，启动时清理旧版本遗留结果。
@@ -85,34 +95,19 @@ def load_scan_rows(service, scan_scope):
     return rows
 
 
+@dataclass
 class ScanContext:
-    def __init__(self, service, run_id, files, control=None):
-        self.service = service
-        self.run_id = run_id
-        self.files = files
-        self.control = control
+    """扫描结果持久化所需上下文。"""
+
+    service: MarketDataService
+    run_id: int
+    files: dict[StockStatus, TextIO]
+    control: Optional[object] = None
 
 
-def build_scan_rows(data, asset_type):
+def build_scan_rows(data: pd.DataFrame, asset_type: str) -> list[dict]:
     """将股票和ETF主数据统一成带资产类型的扫描行，供同一条缓存与策略流水线处理。"""
     return [{**row.to_dict(), "asset_type": asset_type} for _, row in data.iterrows()]
-
-
-class CachedDailyService:
-    """线程内只读SQLite日线，保证并发策略判断不会触发网络访问。"""
-
-    def __init__(self, database, start_date, end_date):
-        self.database = database
-        self.start_date = start_date
-        self.end_date = end_date
-
-    def get_daily_data(self, ts_code, _start_date, _end_date, force_refresh=False):
-        if force_refresh:
-            raise ValueError("缓存并发扫描不支持强制刷新")
-        data = self.database.load_klines(ts_code, "D", self.start_date, self.end_date)
-        result = MarketDataService._prepare_result(data)
-        result.attrs["source"] = "sqlite_cache"
-        return result
 
 
 def stream_scan_results(rows, service, start_date, end_date, control=None, run_id=None):
@@ -175,20 +170,23 @@ def wait_for_next_result(pending):
     return future.result()
 
 
-def scan_cached_row(row, database, start_date, end_date):
-    service = CachedDailyService(database, start_date, end_date)
-    return evaluate_stock_row(row, service)
+def scan_cached_row(row: dict, database, start_date, end_date) -> dict:
+    ts_code = row["ts_code"]
+    data = database.load_klines(ts_code, "D", start_date, end_date)
+    prepared_data = MarketDataService._prepare_result(data)
+    return evaluate_stock_row(row, prepared_data)
 
 
-def evaluate_stock_row(row, service):
+def evaluate_stock_row(row: dict, daily_data: pd.DataFrame) -> dict:
     ts_code = row["ts_code"]
     name = row["name"]
     asset_type = row.get("asset_type", "stock")
-    print(f"[{ts_code}][{name}]")
+    logger.debug("开始计算策略: %s %s", ts_code, name)
     try:
-        return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": daily_check(ts_code, name, service), "error": None}
+        results = evaluate_daily_strategies(daily_data, ts_code, name)
+        return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": results, "error": None}
     except Exception as exc:
-        print(f"[{ts_code}][{name}] 获取或分析失败: {exc}")
+        logger.exception("策略计算失败: %s %s", ts_code, name)
         return {"ts_code": ts_code, "name": name, "asset_type": asset_type, "results": [], "error": exc}
 
 
@@ -218,7 +216,7 @@ def handle_scan_result(context, result, processed_stocks, matched_stocks, error_
         if status == StockStatus.NO_MATCH:
             continue
         matched_signal_types.append(status.value)
-        print(f"[{ts_code}][{name}] {status.value}")
+        logger.info("策略命中: %s %s - %s", ts_code, name, status.value)
         context.files[status].write(f"{ts_code} {name}\n")
         context.files[status].flush()
     if matched_signal_types:
@@ -265,7 +263,9 @@ def retry_scan_errors(run_id, service=None, control=None):
             stock_name = item["stock_name"]
             asset_type = item.get("asset_type", "stock")
             try:
-                results = daily_check(ts_code, stock_name, market_data_service)
+                start_date, end_date = daily_strategy_window()
+                daily_data = market_data_service.get_daily_data(ts_code, start_date, end_date)
+                results = evaluate_daily_strategies(daily_data, ts_code, stock_name)
                 signal_types = [status.value for status in results if status != StockStatus.NO_MATCH]
                 database.save_stock_signals(run_id, ts_code, stock_name, signal_types, asset_type=asset_type)
                 database.resolve_scan_error(run_id, ts_code)
@@ -311,7 +311,7 @@ def remove_empty_file(file_path):
     """清理没有命中结果的输出文件。"""
     if file_path.exists() and not file_path.read_text(encoding="utf-8").strip():
         file_path.unlink()
-        print(f"已删除空文件: {file_path}")
+        logger.debug("已删除空策略结果文件: %s", file_path)
 
 
 if __name__ == "__main__":

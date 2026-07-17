@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 
 import schedule
 
-from common.log_utils import LoggerManager
-from market_data.service import get_default_service
+from infrastructure.logging import LoggerManager
+from market_data.service import close_default_service, get_default_service
 from market_data.trading_calendar import is_trading_time as calendar_is_trading_time
 
 from .ma_monitor import check_ma_cross, get_ma_data
@@ -121,13 +121,13 @@ def _parse_symbol_info(symbol_info):
 
 
 def latest_expected_bar_time(period, now):
-    """根据调度表计算当前时刻之前最近一根应当完成的K线。"""
+    """仅在收盘安全缓冲结束后，将对应K线视为已经完成。"""
     candidates = []
     for scheduled_time in BAR_CLOSE_TIMES.get(period, []):
-        parsed_time = datetime.strptime(scheduled_time, "%H:%M:%S") - timedelta(seconds=10)
-        candidate = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
-        if candidate <= now:
-            candidates.append(candidate)
+        parsed_time = datetime.strptime(scheduled_time, "%H:%M:%S")
+        safe_time = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=parsed_time.second, microsecond=0)
+        if safe_time <= now:
+            candidates.append(safe_time - timedelta(seconds=10))
     return max(candidates) if candidates else None
 
 
@@ -139,7 +139,7 @@ def main():
         setup_monitoring_tasks(symbols, default_service)
         start_scheduler()
     finally:
-        default_service.close()
+        close_default_service()
 
 
 if __name__ == "__main__":

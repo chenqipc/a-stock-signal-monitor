@@ -22,6 +22,9 @@ PROVIDER_RETRY_MAX_DELAY_SECONDS = int(os.getenv("MARKET_DATA_RETRY_MAX_DELAY_SE
 ALLOW_INSECURE_HTTP_FALLBACK = os.getenv("ALLOW_INSECURE_HTTP_FALLBACK", "0") == "1"
 DAILY_CACHE_OVERLAP_BARS = max(2, int(os.getenv("DAILY_CACHE_OVERLAP_BARS", "2")))
 MINUTE_CACHE_TTL_SECONDS = int(os.getenv("MINUTE_CACHE_TTL_SECONDS", "60"))
+DEFAULT_MINUTE_KLINE_RETENTION_DAYS = 2
+MIN_MINUTE_KLINE_RETENTION_DAYS = 2
+MAX_MINUTE_KLINE_RETENTION_DAYS = 3650
 MIN_STOCK_LIST_SIZE = int(os.getenv("MIN_STOCK_LIST_SIZE", "1000"))
 MIN_ETF_LIST_SIZE = int(os.getenv("MIN_ETF_LIST_SIZE", "100"))
 SCAN_CACHED_WORKERS = max(1, int(os.getenv("SCAN_CACHED_WORKERS", "6")))
@@ -92,14 +95,57 @@ def save_database_configuration(database_directory, cloud_sync_mode=False, setti
     if not directory.is_absolute():
         raise ValueError("数据库目录必须是绝对路径")
     directory = directory.resolve()
+    _update_settings(
+        {"database_directory": str(directory), "cloud_sync_mode": bool(cloud_sync_mode)},
+        settings_path,
+    )
+    return get_database_configuration(settings_path)
+
+
+def get_data_maintenance_configuration(settings_path=None):
+    """读取本地数据维护设置，统一以系统设置文件为准。"""
+    settings = _load_settings(settings_path)
+    configured_value = settings.get("minute_kline_retention_days", DEFAULT_MINUTE_KLINE_RETENTION_DAYS)
+    return {"minute_kline_retention_days": _validate_retention_days(configured_value)}
+
+
+def save_data_maintenance_configuration(minute_kline_retention_days, settings_path=None):
+    """保存分钟K线保留期；历史日线不受此设置影响。"""
+    retention_days = _validate_retention_days(minute_kline_retention_days)
+    _update_settings({"minute_kline_retention_days": retention_days}, settings_path)
+    return get_data_maintenance_configuration(settings_path)
+
+
+def _validate_retention_days(value):
+    try:
+        retention_days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("分钟K线保留时间必须是整数") from exc
+    if not MIN_MINUTE_KLINE_RETENTION_DAYS <= retention_days <= MAX_MINUTE_KLINE_RETENTION_DAYS:
+        raise ValueError("分钟K线保留时间必须在2到3650个交易日之间")
+    return retention_days
+
+
+def _update_settings(updates, settings_path=None):
+    """合并写入本机设置，避免数据库设置和数据维护设置互相覆盖。"""
     path = Path(settings_path or APP_SETTINGS_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"database_directory": str(directory), "cloud_sync_mode": bool(cloud_sync_mode)}
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     with _SETTINGS_LOCK:
-        temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        settings = _read_settings_unlocked(path)
+        settings.update(updates)
+        temporary_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary_path.replace(path)
-    return get_database_configuration(path)
+
+
+def _read_settings_unlocked(path):
+    if not path.exists():
+        return {}
+    try:
+        content = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"应用设置文件无法读取: {path}") from exc
+    return content if isinstance(content, dict) else {}
 
 
 def _load_settings(settings_path=None):
@@ -107,11 +153,7 @@ def _load_settings(settings_path=None):
     if not path.exists():
         return {}
     with _SETTINGS_LOCK:
-        try:
-            content = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"应用设置文件无法读取: {path}") from exc
-    return content if isinstance(content, dict) else {}
+        return _read_settings_unlocked(path)
 
 
 # 兼容已有导入；新建服务应调用 get_database_path() 以读取运行时设置。

@@ -1,3 +1,5 @@
+"""股票日线策略状态定义。"""
+
 from enum import Enum
 
 

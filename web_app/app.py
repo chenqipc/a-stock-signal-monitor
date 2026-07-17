@@ -1,45 +1,35 @@
 """Flask Web入口和JSON接口。"""
 
 import sqlite3
-import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 from flask import Flask, jsonify, render_template, request
 
-from common.StockEnum import StockStatus
-from etf_monitor.watchlist import DEFAULT_WATCHLIST
+from etf_monitor.realtime_monitor import MONITOR_PERIODS, RealtimeMonitorManager
 from market_data.config import (
     DATABASE_FILENAME,
+    get_data_maintenance_configuration,
     get_database_configuration,
     get_database_journal_mode,
     get_database_path,
+    save_data_maintenance_configuration,
     save_database_configuration,
 )
 from market_data.database import MarketDataDatabase
 from market_data.service import MarketDataService
 from market_data.trading_calendar import TRADING_SESSIONS
+from stock_signal_monitor.stock_status import StockStatus
 
+from .index_service import IndexMarketService
 from .tasks import TaskManager
 
 
 INDICATOR_TONES = ("emerald", "cyan", "amber", "violet", "rose", "blue")
-INDEX_REFRESH_COOLDOWN_SECONDS = 300
-INDEX_INTRADAY_CACHE_SECONDS = 120
-INDEX_WATCHLIST = (
-    {"symbol": "000001.SH", "name": "上证指数", "short_name": "上证"},
-    {"symbol": "399001.SZ", "name": "深证成指", "short_name": "深成指"},
-    {"symbol": "399006.SZ", "name": "创业板指", "short_name": "创业板"},
-    {"symbol": "000300.SH", "name": "沪深300指数", "short_name": "沪深300"},
-    {"symbol": "000688.SH", "name": "科创50指数", "short_name": "科创50"},
-    {"symbol": "HSI.HK", "name": "恒生指数", "short_name": "恒生"},
-    {"symbol": "IXIC.US", "name": "纳斯达克综合指数", "short_name": "纳斯达克", "allow_current": False},
-    {"symbol": "GOLD.SGE", "name": "Au99.99现货黄金", "short_name": "黄金现货", "allow_current": False},
-)
 
 
-def create_app(config=None, database=None, task_manager=None):
+def create_app(config=None, database=None, task_manager=None, realtime_monitor=None):
     """创建可测试的Web应用实例。"""
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.json.ensure_ascii = False
@@ -51,11 +41,14 @@ def create_app(config=None, database=None, task_manager=None):
     # 后台任务依附于Web进程，启动时先收尾上次进程遗留的运行中记录。
     if app.config.get("RECOVER_INTERRUPTED_TASKS", True):
         market_database.fail_interrupted_scan_runs()
+    if app.config.get("PRUNE_MINUTE_KLINES_ON_START", True):
+        maintenance = get_data_maintenance_configuration(settings_path)
+        market_database.prune_minute_klines(maintenance["minute_kline_retention_days"])
     app.extensions["market_database"] = market_database
     app.extensions["task_manager"] = task_manager or TaskManager()
     app.extensions["database_settings_path"] = settings_path
-    app.extensions["index_refresh_failures"] = {}
-    app.extensions["index_refresh_lock"] = threading.Lock()
+    app.extensions["index_market_service"] = IndexMarketService(market_database)
+    app.extensions["realtime_monitor"] = realtime_monitor or _create_realtime_monitor(market_database, settings_path)
 
     @app.get("/")
     def index():
@@ -79,7 +72,7 @@ def create_app(config=None, database=None, task_manager=None):
                 "indicators": indicators,
                 "latest_signals": db.get_latest_signals(limit=12),
                 "watchlist": _watchlist_payload(db),
-                "indices": {"items": _index_watchlist_payload(app, 120, refresh_missing=False), "period": "D"},
+                "indices": {"items": _index_service(app).load_watchlist(120, refresh_missing=False), "period": "D"},
                 "sources": db.get_source_health(),
                 "tasks": _task_manager(app).get_status(),
             }
@@ -96,13 +89,13 @@ def create_app(config=None, database=None, task_manager=None):
     def indices():
         limit = min(240, _positive_int(request.args.get("limit"), 120))
         refresh_missing = request.args.get("refresh") == "1"
-        return jsonify({"items": _index_watchlist_payload(app, limit, refresh_missing=refresh_missing), "period": "D"})
+        return jsonify({"items": _index_service(app).load_watchlist(limit, refresh_missing=refresh_missing), "period": "D"})
 
     @app.get("/api/indices/<symbol>/history")
     def index_history(symbol):
         """按当前最早K线向前加载单个指数历史，避免缩放时重复刷新全部指数。"""
         normalized_symbol = MarketDataService.normalize_symbol(symbol)
-        if normalized_symbol not in {item["symbol"] for item in INDEX_WATCHLIST}:
+        if normalized_symbol not in _index_service(app).symbols:
             return jsonify({"error": "该标的不属于首页主要指数"}), 404
         try:
             before = pd.Timestamp(request.args.get("before") or datetime.now().date())
@@ -112,8 +105,7 @@ def create_app(config=None, database=None, task_manager=None):
             return jsonify({"error": "before必须是有效日期"}), 400
         limit = min(240, _positive_int(request.args.get("limit"), 120))
         ensure_data = request.args.get("ensure", "1") != "0"
-        with app.extensions["index_refresh_lock"]:
-            payload = _index_history_payload(app, normalized_symbol, before, limit, ensure_data)
+        payload = _index_service(app).load_history(normalized_symbol, before, limit, ensure_data)
         return jsonify(payload)
 
     @app.get("/api/stocks")
@@ -155,6 +147,41 @@ def create_app(config=None, database=None, task_manager=None):
         result["groups"] = database.list_instrument_groups("etf")
         result["selected_group_id"] = group_id
         return jsonify(result)
+
+    @app.get("/api/realtime-monitor")
+    def realtime_monitor_status():
+        return jsonify(_realtime_monitor_payload(app))
+
+    @app.post("/api/realtime-monitor/watchlist")
+    def add_realtime_monitor():
+        """当前仅开放ETF，数据结构已保留asset_type以便后续扩展股票。"""
+        body = request.get_json(silent=True) or {}
+        asset_type = str(body.get("asset_type") or "etf").strip().lower()
+        if asset_type != "etf":
+            return jsonify({"error": "实时监控当前仅支持ETF"}), 400
+        try:
+            monitor = _database(app).add_realtime_monitor(body.get("symbol"), asset_type)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"monitor": monitor, "realtime": _realtime_monitor_payload(app)}), 201
+
+    @app.delete("/api/realtime-monitor/watchlist/<path:symbol>")
+    def remove_realtime_monitor(symbol):
+        if not _database(app).remove_realtime_monitor(symbol):
+            return jsonify({"error": "该ETF不在实时监控池中"}), 404
+        return jsonify({"removed": True, "realtime": _realtime_monitor_payload(app)})
+
+    @app.post("/api/realtime-monitor/start")
+    def start_realtime_monitor():
+        status = _realtime_monitor(app).start()
+        if status["status"] != "running":
+            return jsonify({"error": status.get("last_error") or "实时监控启动失败", "manager": status}), 400
+        return jsonify(_realtime_monitor_payload(app)), 202
+
+    @app.post("/api/realtime-monitor/stop")
+    def stop_realtime_monitor():
+        _realtime_monitor(app).stop()
+        return jsonify(_realtime_monitor_payload(app)), 202
 
     @app.post("/api/instrument-groups")
     def create_instrument_group():
@@ -263,7 +290,12 @@ def create_app(config=None, database=None, task_manager=None):
         limit = min(500, _positive_int(request.args.get("limit"), 120))
         months = min(24, _positive_int(request.args.get("months"), 3 if period == "D" else 1))
         ensure_data = request.args.get("ensure") == "1" and period == "D"
-        end_date = datetime.now().date()
+        before = request.args.get("before")
+        try:
+            before_date = pd.Timestamp(before).normalize() if before and period == "D" else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "before 必须是有效日期"}), 400
+        end_date = (before_date - pd.DateOffset(days=1)).date() if before_date is not None else datetime.now().date()
         start_date = (pd.Timestamp(end_date) - pd.DateOffset(months=months)).date()
         database = _database(app)
         data = database.load_klines(normalized_symbol, period, start_date, end_date) if period == "D" else database.load_klines(normalized_symbol, period)
@@ -284,6 +316,10 @@ def create_app(config=None, database=None, task_manager=None):
                 source = "sqlite_stale_cache" if not data.empty else "unavailable"
             finally:
                 service.close()
+        if before_date is not None and not data.empty:
+            data = data[data["trade_time"] < before_date]
+        # 网络补历史时只要本页有数据就允许继续向前探测，上市首日前的空页会自然终止加载。
+        has_more = period == "D" and (len(data) >= limit or (ensure_data and not data.empty))
         data = data.tail(limit)
         return jsonify(
             {
@@ -291,8 +327,9 @@ def create_app(config=None, database=None, task_manager=None):
                 "period": period,
                 "source": source,
                 "warning": warning,
-                "has_volume": MarketDataService._daily_data_has_volume(data) if period == "D" else False,
-                "has_ohlcv": MarketDataService._daily_data_has_chart_fields(data) if period == "D" else False,
+                "has_more": has_more,
+                "has_volume": MarketDataService._daily_data_has_volume(data),
+                "has_ohlcv": MarketDataService._daily_data_has_chart_fields(data),
                 "items": _frame_records(data),
             }
         )
@@ -315,6 +352,8 @@ def create_app(config=None, database=None, task_manager=None):
         running_tasks = [
             name for name, state in _task_manager(app).get_status().items() if state.get("status") in {"running", "paused"}
         ]
+        if _realtime_monitor(app).get_status().get("status") in {"running", "stopping"}:
+            running_tasks.append("ETF实时监控")
         if running_tasks:
             return jsonify({"error": f"请等待运行中的任务结束后再切换数据库: {', '.join(running_tasks)}"}), 409
         directory = Path(str(body.get("database_directory") or "").strip()).expanduser()
@@ -343,8 +382,31 @@ def create_app(config=None, database=None, task_manager=None):
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:
             return jsonify({"error": f"数据库目录切换失败: {exc}"}), 400
         app.extensions["market_database"] = new_database
+        app.extensions["index_market_service"] = IndexMarketService(new_database)
+        # 实时线程持有原数据库引用，切库时必须先安全停止并绑定新数据库。
+        _realtime_monitor(app).close()
+        app.extensions["realtime_monitor"] = _create_realtime_monitor(new_database, app.extensions["database_settings_path"])
         payload = _database_settings_payload(app)
         payload.update({"copied_current_database": copied, "used_existing_database": target_existed})
+        return jsonify(payload)
+
+    @app.get("/api/settings/data-maintenance")
+    def data_maintenance_settings():
+        return jsonify(_data_maintenance_settings_payload(app))
+
+    @app.post("/api/settings/data-maintenance")
+    def update_data_maintenance_settings():
+        body = request.get_json(silent=True) or {}
+        try:
+            configuration = save_data_maintenance_configuration(
+                body.get("minute_kline_retention_days"),
+                app.extensions["database_settings_path"],
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        deleted_count = _database(app).prune_minute_klines(configuration["minute_kline_retention_days"])
+        payload = _data_maintenance_settings_payload(app)
+        payload["deleted_minute_bars"] = deleted_count
         return jsonify(payload)
 
     @app.get("/api/task-progress")
@@ -418,6 +480,20 @@ def _task_manager(app):
     return app.extensions["task_manager"]
 
 
+def _index_service(app):
+    return app.extensions["index_market_service"]
+
+
+def _realtime_monitor(app):
+    return app.extensions["realtime_monitor"]
+
+
+def _create_realtime_monitor(database, settings_path):
+    """让实时线程动态读取网页设置，保存后无需重启即可使用新的保留期。"""
+    retention_days_provider = lambda: get_data_maintenance_configuration(settings_path)["minute_kline_retention_days"]
+    return RealtimeMonitorManager(database, retention_days_provider=retention_days_provider)
+
+
 def _database_settings_payload(app):
     database = _database(app)
     configuration = get_database_configuration(app.extensions["database_settings_path"])
@@ -431,6 +507,16 @@ def _database_settings_payload(app):
         "cloud_sync_mode": database.journal_mode == "DELETE",
         "journal_mode": database.journal_mode,
         "managed_by_environment": configuration["managed_by_environment"],
+    }
+
+
+def _data_maintenance_settings_payload(app):
+    configuration = get_data_maintenance_configuration(app.extensions["database_settings_path"])
+    return {
+        **configuration,
+        "minimum_retention_days": 2,
+        "maximum_retention_days": 3650,
+        "daily_klines_preserved": True,
     }
 
 
@@ -468,15 +554,19 @@ def _market_state(database):
 
 
 def _watchlist_payload(database):
-    symbols = [item["symbol"] for item in DEFAULT_WATCHLIST]
+    monitors = database.list_realtime_monitors("etf")
+    symbols = [item["symbol"] for item in monitors]
+    if not symbols:
+        return []
     minute_bars = {item["symbol"]: item for item in database.get_latest_bars(symbols, "15min")}
     daily_bars = {item["symbol"]: item for item in database.get_latest_bars(symbols, "D")}
     result = []
-    for watch_item in DEFAULT_WATCHLIST:
-        bar = minute_bars.get(watch_item["symbol"]) or daily_bars.get(watch_item["symbol"])
+    for monitor in monitors:
+        bar = minute_bars.get(monitor["symbol"]) or daily_bars.get(monitor["symbol"])
         result.append(
             {
-                **watch_item,
+                **monitor,
+                "code": monitor["symbol"].split(".", 1)[0],
                 "close": bar.get("close") if bar else None,
                 "pct_chg": bar.get("pct_chg") if bar else None,
                 "period": bar.get("period") if bar else None,
@@ -487,177 +577,21 @@ def _watchlist_payload(database):
     return result
 
 
-def _index_watchlist_payload(app, limit, refresh_missing=False):
-    if refresh_missing:
-        # 串行合并并发刷新；后进入的请求会直接复用前一个请求刚写入SQLite的数据。
-        with app.extensions["index_refresh_lock"]:
-            return _load_index_watchlist_payload(app, limit, refresh_missing=True)
-    return _load_index_watchlist_payload(app, limit, refresh_missing=False)
-
-
-def _load_index_watchlist_payload(app, limit, refresh_missing=False):
+def _realtime_monitor_payload(app):
+    """按ETF聚合四个周期状态，前端可直接渲染为状态矩阵。"""
     database = _database(app)
-    service = MarketDataService(database=database)
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=max(180, limit * 2))
-    result = []
-    try:
-        for item in INDEX_WATCHLIST:
-            result.append(_index_payload_item(app, database, service, item, start_date, end_date, limit, refresh_missing))
-    finally:
-        service.close()
-    return result
-
-
-def _index_payload_item(app, database, service, item, start_date, end_date, limit, refresh_missing=False):
-    source = "sqlite_cache"
-    error = None
-    data = database.load_klines(item["symbol"], "D", start_date, end_date)
-    allow_current = item.get("allow_current", True)
-    needs_refresh = _index_data_needs_refresh(database, item["symbol"], data, end_date, allow_current)
-    if needs_refresh and _index_refresh_is_cooling(app, item["symbol"]):
-        needs_refresh = False
-    try:
-        if refresh_missing and needs_refresh and not _index_refresh_is_cooling(app, item["symbol"]):
-            target_date = _latest_cached_index_target_date(database, end_date, allow_current)
-            data = service.get_daily_data(
-                item["symbol"], start_date, end_date, minimum_trade_time=target_date, refresh_latest=True
-            )
-            source = data.attrs.get("source")
-            still_stale = _index_data_needs_refresh(database, item["symbol"], data, end_date, allow_current)
-            if still_stale:
-                _remember_index_refresh_failure(app, item["symbol"])
-                provider_errors = data.attrs.get("provider_errors") or []
-                error = "; ".join(provider_errors) or "行情源尚未返回当日指数数据"
-            else:
-                _clear_index_refresh_failure(app, item["symbol"])
-            needs_refresh = still_stale and not _index_refresh_is_cooling(app, item["symbol"])
-    except Exception as exc:
-        # 指数补数失败不应该拖慢每次首页打开；失败后短时间内只展示缓存并等待下次冷却结束重试。
-        _remember_index_refresh_failure(app, item["symbol"])
-        error = str(exc)
-        data = database.load_klines(item["symbol"], "D", start_date, end_date)
-        source = "sqlite_stale_cache" if not data.empty else "unavailable"
-        needs_refresh = data.empty and not _index_refresh_is_cooling(app, item["symbol"])
-    if data.empty:
-        source = "unavailable"
-    data = data.tail(limit)
-    points = _frame_records(data)
-    latest = points[-1] if points else {}
-    close = latest.get("close")
-    pct_chg = latest.get("pct_chg")
-    range_pct = _range_percent(data)
-    return {
-        **item,
-        "close": close,
-        "pct_chg": pct_chg,
-        "range_pct": range_pct,
-        "trade_time": latest.get("trade_time"),
-        "source": source,
-        "error": error,
-        "needs_refresh": needs_refresh,
-        "points": points,
-    }
-
-
-def _index_history_payload(app, symbol, before, limit, ensure_data=True):
-    """返回before之前的一批K线；缓存不足时只补该指数的更早区间。"""
-    database = _database(app)
-    end_date = before.normalize() - pd.Timedelta(1, unit="D")
-    start_date = end_date - pd.Timedelta(max(365, limit * 3), unit="D")
-    data = database.load_klines(symbol, "D", start_date, end_date)
-    source = "sqlite_cache" if not data.empty else "unavailable"
-    warning = None
-    if ensure_data and len(data) < limit:
-        service = MarketDataService(database=database)
-        try:
-            data = service.get_daily_data(symbol, start_date, end_date)
-            source = data.attrs.get("source", source)
-            provider_errors = data.attrs.get("provider_errors") or []
-            warning = "; ".join(provider_errors) if provider_errors else None
-        except Exception as exc:
-            warning = str(exc)
-            data = database.load_klines(symbol, "D", start_date, end_date)
-            source = "sqlite_stale_cache" if not data.empty else "unavailable"
-        finally:
-            service.close()
-    data = data[data["trade_time"] < before].tail(limit) if not data.empty else data
-    points = _frame_records(data)
-    return {
-        "symbol": symbol,
-        "period": "D",
-        "source": source,
-        "warning": warning,
-        "has_more": len(points) >= limit,
-        "items": points,
-    }
-
-
-def _index_refresh_is_cooling(app, symbol):
-    failure_time = app.extensions["index_refresh_failures"].get(symbol)
-    if not failure_time:
-        return False
-    return (datetime.now() - failure_time).total_seconds() < INDEX_REFRESH_COOLDOWN_SECONDS
-
-
-def _remember_index_refresh_failure(app, symbol):
-    app.extensions["index_refresh_failures"][symbol] = datetime.now()
-
-
-def _clear_index_refresh_failure(app, symbol):
-    app.extensions["index_refresh_failures"].pop(symbol, None)
-
-
-def _index_data_needs_refresh(database, symbol, data, end_date, allow_current=True):
-    if data is None or data.empty:
-        return True
-    expected_date = _latest_cached_index_target_date(database, end_date, allow_current)
-    latest = pd.to_datetime(data["trade_time"]).max().normalize()
-    state = database.get_fetch_state(symbol, "D") or {}
-    if allow_current and _index_target_is_intraday(expected_date):
-        return latest < expected_date or not _index_cache_is_recent(state)
-    checked_end = pd.Timestamp(state["coverage_end"]).normalize() if state.get("coverage_end") else None
-    return latest < expected_date and (checked_end is None or checked_end < expected_date)
-
-
-def _latest_cached_index_target_date(database, end_date, allow_current=True):
-    candidate = min(pd.Timestamp(end_date).date(), datetime.now().date())
-    market_open_time = TRADING_SESSIONS[0][0]
-    if candidate == datetime.now().date() and (not allow_current or datetime.now().time() < market_open_time):
-        candidate -= timedelta(days=1)
-    for _ in range(15):
-        trading_day = database.get_trading_day(candidate)
-        if trading_day is None:
-            trading_day = candidate.weekday() < 5
-        if trading_day:
-            return pd.Timestamp(candidate)
-        candidate -= timedelta(days=1)
-    return pd.Timestamp(candidate)
-
-
-def _index_target_is_intraday(expected_date):
-    now = datetime.now()
-    ready_time = datetime.strptime("15:30", "%H:%M").time()
-    return pd.Timestamp(expected_date).date() == now.date() and TRADING_SESSIONS[0][0] <= now.time() < ready_time
-
-
-def _index_cache_is_recent(state):
-    last_success_at = state.get("last_success_at")
-    if not last_success_at:
-        return False
-    updated_at = pd.Timestamp(last_success_at)
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.tz_localize("UTC")
-    return pd.Timestamp.now(tz="UTC") - updated_at <= pd.Timedelta(seconds=INDEX_INTRADAY_CACHE_SECONDS)
-
-
-def _range_percent(data):
-    if data is None or data.empty or len(data) < 2:
-        return None
-    first = pd.to_numeric(data["close"], errors="coerce").dropna()
-    if len(first) < 2 or first.iloc[0] == 0:
-        return None
-    return (first.iloc[-1] / first.iloc[0] - 1) * 100
+    monitors = database.list_realtime_monitors("etf")
+    states = database.get_realtime_signal_states([item["symbol"] for item in monitors])
+    state_map = {(item["symbol"], item["period"]): item for item in states}
+    items = []
+    for monitor in monitors:
+        items.append(
+            {
+                **monitor,
+                "periods": {period: state_map.get((monitor["symbol"], period)) for period in MONITOR_PERIODS},
+            }
+        )
+    return {"manager": _realtime_monitor(app).get_status(), "periods": list(MONITOR_PERIODS), "items": items}
 
 
 def _positive_int(value, default):

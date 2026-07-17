@@ -40,6 +40,22 @@ const state = {
     selectedErrorRun: null,
     errorDetail: null,
     databaseSettings: null,
+    maintenanceSettings: null,
+    realtimeMonitor: null,
+    realtimePollTimer: null,
+    realtimeSelectedPeriod: null,
+    realtimeDirectionFilter: null,
+    realtimeCardsSignature: null,
+    minutePreviewTimer: null,
+    minutePreviewAnchor: null,
+    minutePreviewPointer: { x: 0, y: 0 },
+    minutePreviewChart: null,
+    minuteChart: null,
+    minuteChartRequestId: 0,
+    minuteChartSymbol: null,
+    minuteChartName: null,
+    minuteChartPeriod: null,
+    minuteChartPollTimer: null,
     confirmationResolver: null,
     dailyChartCache: new Map(),
     dailyPreviewTimer: null,
@@ -48,18 +64,25 @@ const state = {
     dailyPreviewChart: null,
     dailyChart: null,
     dailyChartRequestId: 0,
+    dailyChartSymbol: null,
+    dailyChartPoints: [],
+    dailyChartDetailByDate: new Map(),
+    dailyChartHistoryLoading: false,
+    dailyChartHistoryExhausted: false,
+    dailyChartSourceData: null,
 };
 
 const viewMeta = {
     overview: ["MARKET INTELLIGENCE", "监控总览"],
-    "daily-custom": ["DAILY STRATEGIES", "日线策略 · 自定义策略"],
-    "daily-other": ["DAILY STRATEGIES", "日线策略 · 其他策略"],
-    "minute-custom": ["MINUTE STRATEGIES", "分钟级策略 · 自定义策略"],
-    "minute-other": ["MINUTE STRATEGIES", "分钟级策略 · 其他策略"],
+    "daily-custom": ["DAILY SIGNALS", "日线策略信号 · 自定义策略"],
+    "daily-other": ["DAILY SIGNALS", "日线策略信号 · 其他策略"],
+    "minute-custom": ["REALTIME SIGNALS", "实时策略信号 · 自定义策略"],
+    "minute-other": ["REALTIME SIGNALS", "实时策略信号 · 其他策略"],
     stocks: ["STOCK UNIVERSE", "股票列表"],
     etfs: ["ETF UNIVERSE", "ETF列表"],
     runs: ["AUTOMATION", "任务记录"],
-    settings: ["PREFERENCES", "系统设置"],
+    "settings-database": ["PREFERENCES", "系统设置 · 数据库存储"],
+    "settings-maintenance": ["PREFERENCES", "系统设置 · 数据维护"],
 };
 
 const toneColors = {
@@ -81,10 +104,16 @@ document.addEventListener("DOMContentLoaded", () => {
         drawChart(state.chartPoints, state.chartItem);
         applyDailyPreviewChartTheme();
         applyDailyChartTheme();
+        applyMinuteChartTheme();
     }, 180));
     document.addEventListener("visibilitychange", () => {
-        if (document.hidden) cancelIndexPoll();
-        else scheduleIndexPoll(1000);
+        if (document.hidden) {
+            cancelIndexPoll();
+            cancelRealtimePoll();
+        } else {
+            scheduleIndexPoll(1000);
+            if (state.currentView === "minute-custom") scheduleRealtimePoll(500);
+        }
     });
     scheduleTaskPoll(1000, true);
 });
@@ -115,6 +144,7 @@ function bindNavigation() {
 
 function showView(viewName) {
     if (viewName === "signals") viewName = "daily-custom";
+    if (viewName === "settings") viewName = "settings-database";
     state.currentView = viewName;
     document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.dataset.view === viewName));
     document.querySelectorAll("[data-view-target]").forEach((button) => {
@@ -130,7 +160,12 @@ function showView(viewName) {
         renderIndicatorFilters();
         loadSignals();
     }
-    if (viewName === "minute-custom") renderWatchlist(state.dashboard?.watchlist || []);
+    if (viewName === "minute-custom") {
+        loadRealtimeMonitor();
+        scheduleRealtimePoll(5000);
+    } else {
+        cancelRealtimePoll();
+    }
     if (viewName === "stocks") loadStocks();
     if (viewName === "etfs") loadEtfs();
     if (viewName === "runs") {
@@ -141,7 +176,8 @@ function showView(viewName) {
     }
     if (viewName === "overview") scheduleIndexPoll(1000);
     else cancelIndexPoll();
-    if (viewName === "settings") loadDatabaseSettings();
+    if (viewName === "settings-database") loadDatabaseSettings();
+    if (viewName === "settings-maintenance") loadMaintenanceSettings();
     window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -158,7 +194,8 @@ function toggleNavGroup(groupName, forceOpen = null) {
 
 function syncStrategyNav(viewName) {
     if (viewName.startsWith("daily-")) toggleNavGroup("daily", true);
-    if (viewName.startsWith("minute-")) toggleNavGroup("minute", true);
+    if (viewName.startsWith("minute-")) toggleNavGroup("realtime", true);
+    if (viewName.startsWith("settings-")) toggleNavGroup("settings", true);
 }
 
 function bindTheme() {
@@ -173,6 +210,7 @@ function bindTheme() {
         updateThemeButton();
         drawChart(state.chartPoints, state.chartItem);
         drawIndexChart(state.indexChartPoints, state.indexChartItem);
+        applyMinuteChartTheme();
     });
 }
 
@@ -214,15 +252,24 @@ function bindActions() {
     document.querySelectorAll("[data-daily-chart-close]").forEach((button) => {
         button.addEventListener("click", closeDailyChartModal);
     });
+    document.querySelectorAll("[data-minute-chart-close]").forEach((button) => {
+        button.addEventListener("click", closeMinuteChartModal);
+    });
+    document.querySelectorAll("[data-minute-chart-period]").forEach((button) => {
+        button.addEventListener("click", () => switchMinuteChartPeriod(button.dataset.minuteChartPeriod));
+    });
     document.getElementById("confirmModalAccept")?.addEventListener("click", () => resolveConfirmation(true));
     document.querySelectorAll("[data-create-group]").forEach((button) => {
         button.addEventListener("click", () => openGroupModal(button.dataset.createGroup));
     });
     document.getElementById("groupForm")?.addEventListener("submit", createGroup);
     document.getElementById("databaseSettingsForm")?.addEventListener("submit", saveDatabaseSettings);
+    document.getElementById("maintenanceSettingsForm")?.addEventListener("submit", saveMaintenanceSettings);
     document.getElementById("deleteStockGroup")?.addEventListener("click", () => deleteCurrentGroup("stock"));
     document.getElementById("deleteEtfGroup")?.addEventListener("click", () => deleteCurrentGroup("etf"));
     document.getElementById("retryErrorsButton")?.addEventListener("click", retrySelectedErrors);
+    document.getElementById("startRealtimeMonitor")?.addEventListener("click", startRealtimeMonitor);
+    document.getElementById("stopRealtimeMonitor")?.addEventListener("click", stopRealtimeMonitor);
     document.addEventListener("keydown", (event) => {
         if (event.key !== "Escape") return;
         const assignModal = document.getElementById("assignGroupModal");
@@ -230,7 +277,9 @@ function bindActions() {
         const errorModal = document.getElementById("errorModal");
         const confirmModal = document.getElementById("confirmModal");
         const dailyChartModal = document.getElementById("dailyChartModal");
+        const minuteChartModal = document.getElementById("minuteChartModal");
         if (confirmModal && !confirmModal.hidden) resolveConfirmation(false);
+        else if (minuteChartModal && !minuteChartModal.hidden) closeMinuteChartModal();
         else if (dailyChartModal && !dailyChartModal.hidden) closeDailyChartModal();
         else if (assignModal && !assignModal.hidden) closeAssignGroupModal();
         else if (groupModal && !groupModal.hidden) closeGroupModal();
@@ -283,6 +332,7 @@ function bindFilters() {
             loadEtfs();
         }
     });
+    document.getElementById("realtimeEtfSearch")?.addEventListener("input", debounce(searchRealtimeEtfs, 260));
 }
 
 async function loadDashboard() {
@@ -296,7 +346,6 @@ async function loadDashboard() {
         renderMetrics(data);
         renderIndicators(data.indicators || []);
         renderLatestSignals(data.latest_signals || []);
-        renderWatchlist(data.watchlist || []);
         renderSources(data.sources || []);
         renderTasks(data.tasks || {}, data.latest_scan);
         renderIndicatorFilters();
@@ -435,6 +484,682 @@ function selectIndexItem(items, index, button) {
     const source = sourceDisplayName(item.source);
     document.getElementById("indexChartMeta").textContent = item.trade_time ? `日线 · ${formatListDate(item.trade_time)} · ${source}` : "等待指数数据";
     drawIndexChart(state.indexChartPoints, item);
+}
+
+async function loadRealtimeMonitor(silent = false) {
+    try {
+        const data = await api("/api/realtime-monitor");
+        state.realtimeMonitor = data;
+        renderRealtimeMonitor(data);
+    } catch (error) {
+        if (!silent) toast(error.message, true);
+    }
+}
+
+function renderRealtimeMonitor(data) {
+    const manager = data.manager || {};
+    const running = ["running", "stopping"].includes(manager.status);
+    const stateElement = document.getElementById("realtimeMonitorState");
+    stateElement.textContent = manager.status === "running" ? "监控运行中" : manager.status === "stopping" ? "正在停止" : "未启动";
+    stateElement.classList.toggle("active", manager.status === "running");
+    stateElement.classList.toggle("stopping", manager.status === "stopping");
+    document.getElementById("startRealtimeMonitor").disabled = running;
+    document.getElementById("stopRealtimeMonitor").disabled = !running;
+    const scanTime = manager.last_scan_at ? `最近扫描 ${formatDate(manager.last_scan_at)}` : "尚未执行扫描";
+    const currentPeriod = manager.current_period ? ` · 正在处理 ${manager.current_period}` : "";
+    document.getElementById("realtimeMonitorMeta").textContent = `${scanTime}${currentPeriod}`;
+    document.getElementById("realtimeIntervals").innerHTML = (data.periods || []).map((period) => {
+        const interval = manager.intervals?.[period];
+        const nextRun = manager.next_runs?.[period];
+        const summary = realtimePeriodSummary(data.items || [], period);
+        const selected = state.realtimeSelectedPeriod === period;
+        return `<div class="realtime-interval-chip ${selected ? "selected" : ""}">
+            <button class="realtime-period-select" data-realtime-period="${period}" type="button">
+                <strong>${escapeHtml(period.replace("min", "分钟"))}</strong>
+                <small>每 ${interval || "—"} 分钟${nextRun ? ` · 下次 ${formatClock(nextRun)}` : ""}</small>
+            </button>
+            <span class="realtime-interval-summary" title="统计至少一条均线发生穿越的ETF数量，同一ETF只计一次">
+                <button class="summary-up ${selected && state.realtimeDirectionFilter === "up" ? "active" : ""}"
+                    data-realtime-direction="up" data-direction-period="${period}" type="button"><i aria-hidden="true">↑</i>上穿 ${summary.up}</button>
+                <button class="summary-down ${selected && state.realtimeDirectionFilter === "down" ? "active" : ""}"
+                    data-realtime-direction="down" data-direction-period="${period}" type="button"><i aria-hidden="true">↓</i>下穿 ${summary.down}</button>
+            </span></div>`;
+    }).join("");
+    document.querySelectorAll("[data-realtime-period]").forEach((button) => {
+        button.addEventListener("click", () => selectRealtimePeriod(button.dataset.realtimePeriod));
+    });
+    document.querySelectorAll("[data-realtime-direction]").forEach((button) => {
+        button.addEventListener("click", () => toggleRealtimeDirection(button.dataset.directionPeriod, button.dataset.realtimeDirection));
+    });
+    renderRealtimeMonitorCards(data.items || [], data.periods || []);
+}
+
+function realtimePeriodSummary(items, period) {
+    return items.reduce((summary, item) => {
+        const periodState = item.periods?.[period];
+        if (!periodState || periodState.error_message) return summary;
+        // 汇总口径与筛选结果保持一致：按ETF去重，而不是累计多条均线信号。
+        if (realtimeStateHasDirection(periodState, "up")) summary.up += 1;
+        if (realtimeStateHasDirection(periodState, "down")) summary.down += 1;
+        return summary;
+    }, { up: 0, down: 0 });
+}
+
+function selectRealtimePeriod(period) {
+    state.realtimeSelectedPeriod = state.realtimeSelectedPeriod === period ? null : period;
+    state.realtimeDirectionFilter = null;
+    state.realtimeCardsSignature = null;
+    if (state.realtimeMonitor) renderRealtimeMonitor(state.realtimeMonitor);
+}
+
+function toggleRealtimeDirection(period, direction) {
+    const sameFilter = state.realtimeSelectedPeriod === period && state.realtimeDirectionFilter === direction;
+    state.realtimeSelectedPeriod = period;
+    state.realtimeDirectionFilter = sameFilter ? null : direction;
+    state.realtimeCardsSignature = null;
+    if (state.realtimeMonitor) renderRealtimeMonitor(state.realtimeMonitor);
+}
+
+function realtimeStateHasDirection(periodState, direction) {
+    return [10, 30, 60].some((window) => periodState?.[`cross_ma${window}`] === direction);
+}
+
+function realtimeStateHasInsufficientData(periodState) {
+    return String(periodState?.error_message || "").startsWith("样本不足：");
+}
+
+function renderRealtimeMonitorCards(items, periods) {
+    const container = document.getElementById("realtimeMonitorCards");
+    const period = state.realtimeSelectedPeriod;
+    const direction = state.realtimeDirectionFilter;
+    const filteredItems = period && direction
+        ? items.filter((item) => realtimeStateHasDirection(item.periods?.[period], direction))
+        : items;
+    const signature = JSON.stringify({ period, direction, items: filteredItems.map((item) => [item.symbol, item.periods]) });
+    const filterLabel = direction === "up" ? "上穿" : direction === "down" ? "下穿" : "全部ETF";
+    const summaryLabel = period ? `${period.replace("min", "分钟")} · ${filterLabel} · ${filteredItems.length}只` : `四周期总览 · ${items.length}只`;
+    document.getElementById("realtimeFilterSummary").textContent = summaryLabel;
+    container.classList.toggle("compact-grid", Boolean(period));
+    if (state.realtimeCardsSignature === signature) return;
+    state.realtimeCardsSignature = signature;
+    hideMinutePreview();
+    if (!items.length) {
+        container.innerHTML = '<div class="empty-state realtime-empty">监控池为空，可在上方搜索ETF，或从“ETF列表”直接加入。</div>';
+        return;
+    }
+    if (period) {
+        renderCompactRealtimeCards(container, filteredItems, period, filterLabel);
+        return;
+    }
+    container.innerHTML = items.map((item) => `
+        <article class="realtime-instrument-card">
+            <div class="realtime-instrument-head">
+                <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.symbol)}</span></div>
+                <button class="row-action danger-action" data-remove-monitor="${escapeHtml(item.symbol)}" type="button">移出监控</button>
+            </div>
+            <div class="realtime-period-grid">
+                ${periods.map((currentPeriod) => realtimePeriodCard(currentPeriod, item.periods?.[currentPeriod], item)).join("")}
+            </div>
+        </article>
+    `).join("");
+    bindRealtimeCardActions(container);
+}
+
+function realtimePeriodCard(period, periodState, item) {
+    const previewAttributes = minutePreviewAttributes(item, period);
+    const viewButton = minuteChartViewButton(item, period, "查看K线");
+    if (!periodState) {
+        return `<div class="realtime-period-card waiting" ${previewAttributes}><div class="period-card-head"><strong>${escapeHtml(period)}</strong>
+            <span>等待扫描</span></div><p>尚无已完成K线状态</p>${viewButton}</div>`;
+    }
+    if (periodState.error_message) {
+        const insufficient = realtimeStateHasInsufficientData(periodState);
+        const issueClass = insufficient ? "insufficient" : "error";
+        const issueLabel = insufficient ? "样本不足" : "获取失败";
+        return `<div class="realtime-period-card ${issueClass}" ${previewAttributes}><div class="period-card-head"><strong>${escapeHtml(period)}</strong>
+            <span>${issueLabel}</span></div><p title="${escapeHtml(periodState.error_message)}">${escapeHtml(periodState.error_message)}</p>
+            <small>${formatDate(periodState.evaluated_at)}</small>${viewButton}</div>`;
+    }
+    const crosses = [10, 30, 60].map((window) => {
+        const direction = periodState[`cross_ma${window}`];
+        const label = direction === "up" ? "上穿" : direction === "down" ? "下穿" : "无穿越";
+        return `<span class="ma-signal ${direction ? `cross-${direction}` : "cross-none"}">MA${window} ${label}</span>`;
+    }).join("");
+    const positionClass = periodState.above_all ? "above-all" : "below-ma";
+    const positionLabel = periodState.above_all ? "三线之上" : "未站上三线";
+    return `<div class="realtime-period-card" ${previewAttributes}><div class="period-card-head"><strong>${escapeHtml(period)}</strong>
+        <span class="${positionClass}">${positionLabel}</span></div><div class="ma-signal-row">${crosses}</div>
+        <div class="period-price"><b>${formatMarketPrice(periodState.close)}</b><span>${escapeHtml(sourceDisplayName(periodState.source))}</span></div>
+        <small>${formatDate(periodState.bar_time)}</small>${viewButton}</div>`;
+}
+
+function minutePreviewAttributes(item, period) {
+    return `data-minute-preview-symbol="${escapeHtml(item.symbol)}" data-minute-preview-name="${escapeHtml(item.name)}"
+        data-minute-preview-period="${escapeHtml(period)}"`;
+}
+
+function minuteChartViewButton(item, period, label) {
+    return `<button class="row-action minute-chart-action" data-view-minute-chart="${escapeHtml(item.symbol)}"
+        data-minute-name="${escapeHtml(item.name)}" data-minute-period="${escapeHtml(period)}" type="button">${label}</button>`;
+}
+
+function renderCompactRealtimeCards(container, items, period, filterLabel) {
+    if (!items.length) {
+        container.innerHTML = `<div class="empty-state realtime-empty">当前没有${filterLabel}的ETF，再次点击筛选图标可查看全部。</div>`;
+        return;
+    }
+    container.innerHTML = items.map((item) => compactRealtimeCard(item, period)).join("");
+    bindRealtimeCardActions(container);
+}
+
+function compactRealtimeCard(item, period) {
+    const periodState = item.periods?.[period];
+    const previewAttributes = minutePreviewAttributes(item, period);
+    const header = `<div class="realtime-instrument-head"><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.symbol)}</span></div>
+        <button class="compact-remove-monitor" data-remove-monitor="${escapeHtml(item.symbol)}" type="button" title="移出监控">×</button></div>`;
+    const footer = `<footer class="compact-realtime-actions"><span>悬停预览</span>${minuteChartViewButton(item, period, "查看K线")}</footer>`;
+    if (!periodState) {
+        return `<article class="realtime-instrument-card compact waiting" ${previewAttributes}>${header}
+            <div class="compact-realtime-state">等待 ${escapeHtml(period)} 扫描</div>${footer}</article>`;
+    }
+    if (periodState.error_message) {
+        const insufficient = realtimeStateHasInsufficientData(periodState);
+        const issueClass = insufficient ? "insufficient" : "error";
+        const messageClass = insufficient ? "compact-realtime-insufficient" : "compact-realtime-error";
+        return `<article class="realtime-instrument-card compact ${issueClass}" ${previewAttributes}>${header}
+            <p class="${messageClass}" title="${escapeHtml(periodState.error_message)}">${escapeHtml(periodState.error_message)}</p>${footer}</article>`;
+    }
+    const crosses = [10, 30, 60].map((window) => {
+        const direction = periodState[`cross_ma${window}`];
+        const icon = direction === "up" ? "↑" : direction === "down" ? "↓" : "";
+        const label = direction === "up" ? "上穿" : direction === "down" ? "下穿" : "—";
+        return `<span class="ma-signal ${direction ? `cross-${direction}` : "cross-none"}">${icon} MA${window} ${label}</span>`;
+    }).join("");
+    const positionClass = periodState.above_all ? "above-all" : "below-ma";
+    const positionLabel = periodState.above_all ? "三线之上" : "未站上三线";
+    return `<article class="realtime-instrument-card compact" ${previewAttributes}>${header}
+        <div class="compact-realtime-price"><b>${formatMarketPrice(periodState.close)}</b><span class="${positionClass}">${positionLabel}</span></div>
+        <div class="ma-signal-row">${crosses}</div><div class="compact-realtime-meta"><span>${escapeHtml(sourceDisplayName(periodState.source))}</span>
+        <small>${formatDate(periodState.bar_time)}</small></div>${footer}</article>`;
+}
+
+function bindRealtimeCardActions(container) {
+    container.querySelectorAll("[data-remove-monitor]").forEach((button) => {
+        button.addEventListener("click", () => removeRealtimeMonitor(button.dataset.removeMonitor));
+    });
+    container.querySelectorAll("[data-view-minute-chart]").forEach((button) => {
+        button.addEventListener("click", () => {
+            openMinuteChartModal(button.dataset.viewMinuteChart, button.dataset.minuteName, button.dataset.minutePeriod);
+        });
+    });
+    bindMinutePreviewCards(container);
+}
+
+async function startRealtimeMonitor() {
+    try {
+        const data = await api("/api/realtime-monitor/start", { method: "POST", body: "{}" });
+        state.realtimeMonitor = data;
+        renderRealtimeMonitor(data);
+        scheduleRealtimePoll(2000);
+        toast("ETF实时监控已启动");
+    } catch (error) {
+        toast(error.message, true);
+    }
+}
+
+async function stopRealtimeMonitor() {
+    try {
+        const data = await api("/api/realtime-monitor/stop", { method: "POST", body: "{}" });
+        state.realtimeMonitor = data;
+        renderRealtimeMonitor(data);
+        scheduleRealtimePoll(1000);
+        toast("正在安全停止实时监控");
+    } catch (error) {
+        toast(error.message, true);
+    }
+}
+
+async function searchRealtimeEtfs() {
+    const query = document.getElementById("realtimeEtfSearch").value.trim();
+    const container = document.getElementById("realtimeSearchResults");
+    if (!query) {
+        container.hidden = true;
+        container.innerHTML = "";
+        return;
+    }
+    try {
+        const data = await api(`/api/etfs?q=${encodeURIComponent(query)}&page_size=8`);
+        container.hidden = false;
+        container.innerHTML = data.items.length ? data.items.map((item) => `
+            <div class="realtime-search-item"><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.ts_code)}</small></span>
+                <button class="row-action ${item.is_monitored ? "monitored" : ""}" data-search-monitor="${escapeHtml(item.ts_code)}"
+                type="button" ${item.is_monitored ? "disabled" : ""}>${item.is_monitored ? "已监控" : "加入监控"}</button></div>
+        `).join("") : '<div class="empty-state">没有匹配的ETF</div>';
+        container.querySelectorAll("[data-search-monitor]").forEach((button) => {
+            button.addEventListener("click", () => addRealtimeMonitor(button.dataset.searchMonitor));
+        });
+    } catch (error) {
+        toast(error.message, true);
+    }
+}
+
+async function addRealtimeMonitor(symbol) {
+    try {
+        const data = await api("/api/realtime-monitor/watchlist", {
+            method: "POST",
+            body: JSON.stringify({ symbol, asset_type: "etf" }),
+        });
+        state.realtimeMonitor = data.realtime;
+        if (state.currentView === "minute-custom") {
+            renderRealtimeMonitor(data.realtime);
+            // 加入成功后结束本次搜索，避免已监控结果继续遮挡状态矩阵。
+            clearRealtimeEtfSearch();
+        }
+        if (state.currentView === "etfs") loadEtfs();
+        toast(`${symbol} 已加入实时监控池`);
+    } catch (error) {
+        toast(error.message, true);
+    }
+}
+
+function clearRealtimeEtfSearch() {
+    const input = document.getElementById("realtimeEtfSearch");
+    const container = document.getElementById("realtimeSearchResults");
+    if (input) input.value = "";
+    if (!container) return;
+    container.innerHTML = "";
+    container.hidden = true;
+}
+
+async function removeRealtimeMonitor(symbol) {
+    const confirmed = await confirmAction({
+        title: "移出实时监控",
+        message: `确定将 ${symbol} 移出实时监控池吗？历史穿越事件仍会保留。`,
+        confirmText: "移出",
+        tone: "danger",
+    });
+    if (!confirmed) return;
+    try {
+        const data = await api(`/api/realtime-monitor/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+        state.realtimeMonitor = data.realtime;
+        renderRealtimeMonitor(data.realtime);
+        toast(`${symbol} 已移出实时监控池`);
+    } catch (error) {
+        toast(error.message, true);
+    }
+}
+
+function scheduleRealtimePoll(delay = 5000) {
+    cancelRealtimePoll();
+    if (state.currentView !== "minute-custom" || document.hidden) return;
+    state.realtimePollTimer = window.setTimeout(async () => {
+        await loadRealtimeMonitor(true);
+        scheduleRealtimePoll();
+    }, delay);
+}
+
+function cancelRealtimePoll() {
+    window.clearTimeout(state.realtimePollTimer);
+    state.realtimePollTimer = null;
+}
+
+function bindMinutePreviewCards(container) {
+    container.querySelectorAll("[data-minute-preview-symbol]").forEach((card) => {
+        card.addEventListener("pointerenter", (event) => scheduleMinutePreview(card, event));
+        card.addEventListener("pointermove", (event) => {
+            if (event.pointerType === "touch") return;
+            state.minutePreviewPointer = { x: event.clientX, y: event.clientY };
+            if (state.minutePreviewAnchor === card) positionMinutePreview(event.clientX, event.clientY);
+        });
+        card.addEventListener("pointerleave", () => hideMinutePreview(card));
+    });
+}
+
+function scheduleMinutePreview(card, event) {
+    if (event.pointerType === "touch") return;
+    window.clearTimeout(state.minutePreviewTimer);
+    state.minutePreviewPointer = { x: event.clientX, y: event.clientY };
+    state.minutePreviewTimer = window.setTimeout(() => showMinutePreview(card), 260);
+}
+
+async function showMinutePreview(card) {
+    const { minutePreviewSymbol: symbol, minutePreviewName: name, minutePreviewPeriod: period } = card.dataset;
+    const popover = document.getElementById("minutePreviewPopover");
+    state.minutePreviewAnchor = card;
+    document.getElementById("minutePreviewName").textContent = name;
+    document.getElementById("minutePreviewSymbol").textContent = symbol;
+    document.getElementById("minutePreviewPeriod").textContent = period.replace("min", "分钟");
+    document.getElementById("minutePreviewMeta").textContent = "正在读取分钟K线缓存…";
+    document.getElementById("minutePreviewClose").textContent = "—";
+    popover.hidden = false;
+    positionMinutePreview(state.minutePreviewPointer.x, state.minutePreviewPointer.y);
+    destroyMinutePreviewChart();
+    document.getElementById("minutePreviewChart").innerHTML = '<div class="chart-loading">正在加载实时K线…</div>';
+    try {
+        const data = await fetchMinuteSeries(symbol, period, 160);
+        if (state.minutePreviewAnchor !== card) return;
+        renderMinutePreviewChart(data.items || []);
+        const latest = (data.items || []).at(-1) || {};
+        document.getElementById("minutePreviewClose").textContent = formatMarketPrice(latest.close);
+        document.getElementById("minutePreviewMeta").textContent = latest.trade_time
+            ? `${formatDate(latest.trade_time)} · ${sourceDisplayName(data.source)}`
+            : "暂无分钟K线缓存";
+        positionMinutePreview(state.minutePreviewPointer.x, state.minutePreviewPointer.y);
+    } catch (error) {
+        if (state.minutePreviewAnchor !== card) return;
+        document.getElementById("minutePreviewMeta").textContent = "分钟K线读取失败";
+        document.getElementById("minutePreviewChart").innerHTML = `<div class="chart-loading error">${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function positionMinutePreview(x, y) {
+    const popover = document.getElementById("minutePreviewPopover");
+    if (!popover || popover.hidden) return;
+    const gap = 16;
+    const left = x + gap + popover.offsetWidth > window.innerWidth ? x - popover.offsetWidth - gap : x + gap;
+    const top = y + gap + popover.offsetHeight > window.innerHeight ? y - popover.offsetHeight - gap : y + gap;
+    popover.style.left = `${Math.max(12, Math.min(left, window.innerWidth - popover.offsetWidth - 12))}px`;
+    popover.style.top = `${Math.max(12, Math.min(top, window.innerHeight - popover.offsetHeight - 12))}px`;
+}
+
+function hideMinutePreview(card = null) {
+    window.clearTimeout(state.minutePreviewTimer);
+    if (card && state.minutePreviewAnchor && state.minutePreviewAnchor !== card) return;
+    state.minutePreviewAnchor = null;
+    destroyMinutePreviewChart();
+    const popover = document.getElementById("minutePreviewPopover");
+    if (popover) popover.hidden = true;
+}
+
+function fetchMinuteSeries(symbol, period, limit = 500) {
+    const params = new URLSearchParams({ period, limit: String(limit) });
+    if (period === "D") {
+        params.set("months", "24");
+        params.set("ensure", "1");
+    }
+    return api(`/api/klines/${encodeURIComponent(symbol)}?${params.toString()}`);
+}
+
+function renderMinutePreviewChart(points) {
+    const container = document.getElementById("minutePreviewChart");
+    const library = window.LightweightCharts;
+    const candles = normalizeMinuteCandles(points);
+    destroyMinutePreviewChart();
+    if (!library || candles.length < 2) {
+        container.innerHTML = '<div class="chart-loading">暂无足够的分钟K线缓存</div>';
+        return;
+    }
+    container.innerHTML = "";
+    const styles = getComputedStyle(document.documentElement);
+    const red = styles.getPropertyValue("--red").trim();
+    const green = styles.getPropertyValue("--green").trim();
+    const amber = styles.getPropertyValue("--amber").trim();
+    const cyan = styles.getPropertyValue("--cyan").trim();
+    const violet = styles.getPropertyValue("--violet").trim();
+    const chart = library.createChart(container, {
+        ...minuteChartThemeOptions(),
+        autoSize: true,
+        handleScroll: false,
+        handleScale: false,
+        rightPriceScale: { visible: false },
+        timeScale: { visible: false, timeVisible: true, barSpacing: 6, minBarSpacing: 2 },
+        crosshair: { vertLine: { visible: false }, horzLine: { visible: false } },
+    });
+    const series = chart.addSeries(library.CandlestickSeries, {
+        upColor: red, downColor: green, wickUpColor: red, wickDownColor: green, borderVisible: false,
+        priceLineVisible: false, lastValueVisible: false,
+    });
+    // 预览直接复用异步读取到的持久化均线，不增加行情请求和前端轮询。
+    const ma10Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(amber));
+    const ma30Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(cyan));
+    const ma60Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(violet));
+    series.setData(candles);
+    ma10Series.setData(minuteMovingAverageSeries(candles, "ma10", 10));
+    ma30Series.setData(minuteMovingAverageSeries(candles, "ma30", 30));
+    ma60Series.setData(minuteMovingAverageSeries(candles, "ma60", 60));
+    chart.timeScale().fitContent();
+    state.minutePreviewChart = chart;
+}
+
+function destroyMinutePreviewChart() {
+    if (state.minutePreviewChart) state.minutePreviewChart.remove();
+    state.minutePreviewChart = null;
+}
+
+async function openMinuteChartModal(symbol, name, period) {
+    hideMinutePreview();
+    const modal = document.getElementById("minuteChartModal");
+    const requestId = ++state.minuteChartRequestId;
+    destroyMinuteChart();
+    state.minuteChartSymbol = symbol;
+    state.minuteChartName = name;
+    state.minuteChartPeriod = period;
+    document.getElementById("minuteChartTitle").textContent = `${name} · ${symbol}`;
+    document.getElementById("minuteChartSubtitle").textContent = `${klinePeriodLabel(period)}K线 · 本地缓存`;
+    document.getElementById("minuteChartContainer").innerHTML = '<div class="chart-loading">正在加载实时K线…</div>';
+    renderMinuteChartSummary([]);
+    syncMinuteChartPeriodSwitcher();
+    modal.hidden = false;
+    syncModalOpenState();
+    await refreshMinuteChartModal(requestId);
+    if (!modal.hidden) {
+        modal.querySelector(".modal-close").focus();
+        scheduleMinuteChartRefresh();
+    }
+}
+
+async function switchMinuteChartPeriod(period) {
+    const supportedPeriods = new Set(["15min", "30min", "60min", "120min", "D"]);
+    const modal = document.getElementById("minuteChartModal");
+    if (!supportedPeriods.has(period) || !modal || modal.hidden || state.minuteChartPeriod === period) return;
+    const requestId = ++state.minuteChartRequestId;
+    window.clearTimeout(state.minuteChartPollTimer);
+    state.minuteChartPollTimer = null;
+    state.minuteChartPeriod = period;
+    if (state.minuteChart) state.minuteChart.remove();
+    state.minuteChart = null;
+    syncMinuteChartPeriodSwitcher();
+    document.getElementById("minuteChartSubtitle").textContent = `${klinePeriodLabel(period)}K线 · 正在读取`;
+    document.getElementById("minuteChartContainer").innerHTML = '<div class="chart-loading">正在切换K线周期…</div>';
+    document.getElementById("minuteChartSource").textContent = period === "D" ? "正在按需补充日线缓存…" : "正在读取分钟K线缓存…";
+    renderMinuteChartSummary([]);
+    await refreshMinuteChartModal(requestId);
+    if (!modal.hidden) scheduleMinuteChartRefresh();
+}
+
+function syncMinuteChartPeriodSwitcher() {
+    document.querySelectorAll("[data-minute-chart-period]").forEach((button) => {
+        const active = button.dataset.minuteChartPeriod === state.minuteChartPeriod;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+    });
+}
+
+function klinePeriodLabel(period) {
+    return period === "D" ? "日线" : period.replace("min", "分钟");
+}
+
+async function refreshMinuteChartModal(requestId = state.minuteChartRequestId) {
+    const { minuteChartSymbol: symbol, minuteChartPeriod: period } = state;
+    if (!symbol || !period) return;
+    try {
+        const data = await fetchMinuteSeries(symbol, period, 500);
+        if (requestId !== state.minuteChartRequestId || document.getElementById("minuteChartModal").hidden) return;
+        const points = data.items || [];
+        renderMinuteChartSummary(points);
+        renderProfessionalMinuteChart(points, period);
+        document.getElementById("minuteChartSubtitle").textContent = `${klinePeriodLabel(period)}K线 · ${points.length}根本地缓存`;
+        const refreshText = period === "D" ? "日线按需读取" : "每10秒自动读取最新缓存";
+        const warning = data.warning ? ` · ${data.warning}` : "";
+        document.getElementById("minuteChartSource").textContent = `${sourceDisplayName(data.source)} · ${points.length}根K线 · ${refreshText}${warning}`;
+    } catch (error) {
+        if (requestId !== state.minuteChartRequestId) return;
+        document.getElementById("minuteChartContainer").innerHTML = `<div class="chart-loading error">${escapeHtml(error.message)}</div>`;
+        document.getElementById("minuteChartSource").textContent = "K线读取失败";
+    }
+}
+
+function scheduleMinuteChartRefresh() {
+    window.clearTimeout(state.minuteChartPollTimer);
+    if (!state.minuteChartSymbol || state.minuteChartPeriod === "D" || document.getElementById("minuteChartModal").hidden) return;
+    state.minuteChartPollTimer = window.setTimeout(async () => {
+        await refreshMinuteChartModal();
+        scheduleMinuteChartRefresh();
+    }, 10000);
+}
+
+function closeMinuteChartModal() {
+    const modal = document.getElementById("minuteChartModal");
+    if (!modal || modal.hidden) return;
+    modal.hidden = true;
+    state.minuteChartRequestId += 1;
+    window.clearTimeout(state.minuteChartPollTimer);
+    state.minuteChartPollTimer = null;
+    destroyMinuteChart();
+    syncModalOpenState();
+}
+
+function destroyMinuteChart() {
+    if (state.minuteChart) state.minuteChart.remove();
+    state.minuteChart = null;
+    state.minuteChartSymbol = null;
+    state.minuteChartName = null;
+    state.minuteChartPeriod = null;
+}
+
+function renderMinuteChartSummary(points) {
+    const valid = points.filter((item) => numberOrNull(item.close) !== null);
+    const latest = valid.at(-1) || {};
+    const highs = valid.map((item) => numberOrNull(item.high)).filter((value) => value !== null);
+    const lows = valid.map((item) => numberOrNull(item.low)).filter((value) => value !== null);
+    const values = [
+        ["最新价", formatMarketPrice(latest.close)],
+        ["区间最高", highs.length ? formatMarketPrice(Math.max(...highs)) : "—"],
+        ["区间最低", lows.length ? formatMarketPrice(Math.min(...lows)) : "—"],
+        ["最新成交量", formatCompactMarketValue(latest.vol)],
+        ["最新成交额", formatCompactMarketValue(latest.amount, "元")],
+        ["K线时间", latest.trade_time ? formatDate(latest.trade_time) : "—"],
+    ];
+    document.getElementById("minuteChartSummary").innerHTML = values.map(([label, value]) => `
+        <div><span>${label}</span><strong>${value}</strong></div>
+    `).join("");
+}
+
+function renderProfessionalMinuteChart(points, period = state.minuteChartPeriod) {
+    const container = document.getElementById("minuteChartContainer");
+    const library = window.LightweightCharts;
+    const candles = period === "D" ? normalizeDailyCandles(points) : normalizeMinuteCandles(points);
+    if (state.minuteChart) state.minuteChart.remove();
+    state.minuteChart = null;
+    if (!library || candles.length < 2) {
+        container.innerHTML = `<div class="chart-loading">暂无足够的${klinePeriodLabel(period)}K线缓存</div>`;
+        return;
+    }
+    container.innerHTML = "";
+    const styles = getComputedStyle(document.documentElement);
+    const red = styles.getPropertyValue("--red").trim();
+    const green = styles.getPropertyValue("--green").trim();
+    const cyan = styles.getPropertyValue("--cyan").trim();
+    const amber = styles.getPropertyValue("--amber").trim();
+    const violet = styles.getPropertyValue("--violet").trim();
+    const chartOptions = period === "D" ? dailyChartThemeOptions() : minuteChartThemeOptions();
+    const chart = library.createChart(container, { ...chartOptions, autoSize: true });
+    const candleSeries = chart.addSeries(library.CandlestickSeries, {
+        upColor: red, downColor: green, wickUpColor: red, wickDownColor: green, borderVisible: false,
+    });
+    const ma10Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(amber));
+    const ma30Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(cyan));
+    const ma60Series = chart.addSeries(library.LineSeries, minuteMovingAverageOptions(violet));
+    const volumeSeries = chart.addSeries(library.HistogramSeries, {
+        priceFormat: { type: "volume" }, priceScaleId: "volume", priceLineVisible: false, lastValueVisible: false,
+    });
+    candleSeries.setData(candles);
+    ma10Series.setData(period === "D" ? movingAverageSeries(candles, 10) : minuteMovingAverageSeries(candles, "ma10", 10));
+    ma30Series.setData(period === "D" ? movingAverageSeries(candles, 30) : minuteMovingAverageSeries(candles, "ma30", 30));
+    ma60Series.setData(period === "D" ? movingAverageSeries(candles, 60) : minuteMovingAverageSeries(candles, "ma60", 60));
+    volumeSeries.setData(candles.map((item) => ({
+        time: item.time, value: item.vol || 0, color: colorWithAlpha(item.close >= item.open ? red : green, 0.55),
+    })));
+    chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.08, bottom: 0.28 } });
+    chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+    chart.timeScale().fitContent();
+    state.minuteChart = chart;
+}
+
+function minuteMovingAverageOptions(color) {
+    return { color, lineWidth: 2, priceLineVisible: false, lastValueVisible: false };
+}
+
+function minuteMovingAverageSeries(candles, key, windowSize) {
+    const persisted = candles
+        .filter((item) => item[key] !== null)
+        .map((item) => ({ time: item.time, value: item[key] }));
+    // 兼容尚未经过新扫描回填均线的旧缓存；至少两个点才能绘制有效折线。
+    return persisted.length >= 2 ? persisted : movingAverageSeries(candles, windowSize);
+}
+
+function minuteChartThemeOptions() {
+    const options = dailyChartThemeOptions();
+    return {
+        ...options,
+        timeScale: { ...options.timeScale, timeVisible: true, secondsVisible: false, tickMarkFormatter: formatMinuteChartTick },
+        localization: { locale: "zh-CN", timeFormatter: formatMinuteChartTime },
+    };
+}
+
+function applyMinuteChartTheme() {
+    if (state.minutePreviewChart) state.minutePreviewChart.applyOptions(minuteChartThemeOptions());
+    if (state.minuteChart) {
+        const options = state.minuteChartPeriod === "D" ? dailyChartThemeOptions() : minuteChartThemeOptions();
+        state.minuteChart.applyOptions(options);
+    }
+}
+
+function normalizeMinuteCandles(points) {
+    const candles = points.map((item) => ({
+        time: minuteTimestamp(item.trade_time),
+        open: numberOrNull(item.open),
+        high: numberOrNull(item.high),
+        low: numberOrNull(item.low),
+        close: numberOrNull(item.close),
+        vol: numberOrNull(item.vol),
+        ma10: numberOrNull(item.ma10),
+        ma30: numberOrNull(item.ma30),
+        ma60: numberOrNull(item.ma60),
+    })).filter((item) => item.time && [item.open, item.high, item.low, item.close].every((value) => value !== null));
+    return candles.sort((left, right) => left.time - right.time);
+}
+
+function minuteTimestamp(value) {
+    const text = String(value || "").trim().replace(" ", "T");
+    if (!text) return null;
+    const zonedText = /(?:Z|[+-]\d{2}:?\d{2})$/.test(text) ? text : `${text}+08:00`;
+    const timestamp = Date.parse(zonedText);
+    return Number.isFinite(timestamp) ? Math.floor(timestamp / 1000) : null;
+}
+
+function formatMinuteChartTime(timestamp) {
+    if (typeof timestamp !== "number") return String(timestamp || "");
+    return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    }).format(new Date(timestamp * 1000));
+}
+
+function formatMinuteChartTick(timestamp) {
+    if (typeof timestamp !== "number") return String(timestamp || "");
+    return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    }).format(new Date(timestamp * 1000));
 }
 
 function renderWatchlist(items) {
@@ -954,13 +1679,15 @@ function instrumentActions(assetType, item) {
     const code = escapeHtml(item.ts_code);
     const name = escapeHtml(item.name);
     const dailyButton = `<button class="row-action daily-view-action" data-view-daily="${code}" data-name="${name}" type="button">查看日线</button>`;
+    const monitorButton = assetType === "etf" ? `<button class="row-action monitor-action ${item.is_monitored ? "monitored" : ""}"
+        data-monitor-asset="${code}" type="button" ${item.is_monitored ? "disabled" : ""}>${item.is_monitored ? "已实时监控" : "加入实时监控"}</button>` : "";
     if (!groupId) {
-        return `<div class="row-actions">${dailyButton}<button class="row-action" data-assign-asset="${assetType}"
+        return `<div class="row-actions">${dailyButton}${monitorButton}<button class="row-action" data-assign-asset="${assetType}"
             data-code="${code}" data-name="${name}" type="button">加入分组</button></div>`;
     }
     const pinLabel = item.is_pinned ? "取消置顶" : "置顶";
     const pinClass = item.is_pinned ? "row-action pinned" : "row-action";
-    return `<div class="row-actions">${dailyButton}<button class="${pinClass}" data-pin-asset="${assetType}" data-code="${code}"
+    return `<div class="row-actions">${dailyButton}${monitorButton}<button class="${pinClass}" data-pin-asset="${assetType}" data-code="${code}"
         data-pinned="${item.is_pinned ? "true" : "false"}" type="button">${item.is_pinned ? "★" : "☆"} ${pinLabel}</button>
         <button class="row-action danger-action" data-remove-asset="${assetType}" data-code="${code}" type="button">移出分组</button></div>`;
 }
@@ -979,6 +1706,9 @@ function bindInstrumentActions(container) {
     });
     container.querySelectorAll("[data-assign-asset]").forEach((button) => {
         button.addEventListener("click", () => openAssignGroupModal(button.dataset.assignAsset, button.dataset.code, button.dataset.name));
+    });
+    container.querySelectorAll("[data-monitor-asset]").forEach((button) => {
+        button.addEventListener("click", () => addRealtimeMonitor(button.dataset.monitorAsset));
     });
     container.querySelectorAll("[data-pin-asset]").forEach((button) => {
         button.addEventListener("click", () => toggleInstrumentPin(button.dataset.pinAsset, button.dataset.code, button.dataset.pinned));
@@ -1124,6 +1854,7 @@ async function openDailyChartModal(symbol, name) {
     const modal = document.getElementById("dailyChartModal");
     const requestId = ++state.dailyChartRequestId;
     destroyDailyChart();
+    state.dailyChartSymbol = symbol;
     document.getElementById("dailyChartTitle").textContent = `${name} · ${symbol}`;
     document.getElementById("dailyChartSubtitle").textContent = "近一年日K、均线与成交量";
     document.getElementById("dailyChartContainer").innerHTML = '<div class="chart-loading">正在加载日线与成交量…</div>';
@@ -1135,6 +1866,9 @@ async function openDailyChartModal(symbol, name) {
         const data = await fetchDailySeries(symbol, 12, 260);
         if (requestId !== state.dailyChartRequestId || modal.hidden) return;
         const points = data.items || [];
+        state.dailyChartPoints = points;
+        state.dailyChartSourceData = data;
+        updateDailyChartDetailMap(points);
         renderDailyChartSummary(points);
         const cacheState = data.has_ohlcv ? "OHLCV已缓存" : "OHLCV数据不完整";
         document.getElementById("dailyChartSource").textContent = `${sourceDisplayName(data.source)} · ${points.length} 个交易日 · ${cacheState}`;
@@ -1142,7 +1876,7 @@ async function openDailyChartModal(symbol, name) {
         const warningMessage = data.warning || (data.has_ohlcv ? "" : "当前行情源未能提供完整的开高低收和成交量数据");
         warning.hidden = !warningMessage;
         warning.textContent = warningMessage;
-        renderProfessionalDailyChart(points);
+        renderProfessionalDailyChart(points, symbol);
     } catch (error) {
         if (requestId !== state.dailyChartRequestId) return;
         document.getElementById("dailyChartContainer").innerHTML = `<div class="chart-loading error">${escapeHtml(error.message)}</div>`;
@@ -1163,6 +1897,12 @@ function closeDailyChartModal() {
 function destroyDailyChart() {
     if (state.dailyChart) state.dailyChart.remove();
     state.dailyChart = null;
+    state.dailyChartSymbol = null;
+    state.dailyChartPoints = [];
+    state.dailyChartDetailByDate = new Map();
+    state.dailyChartHistoryLoading = false;
+    state.dailyChartHistoryExhausted = false;
+    state.dailyChartSourceData = null;
 }
 
 function renderDailyChartSummary(points) {
@@ -1184,7 +1924,7 @@ function renderDailyChartSummary(points) {
     `).join("");
 }
 
-function renderProfessionalDailyChart(points) {
+function renderProfessionalDailyChart(points, symbol) {
     const container = document.getElementById("dailyChartContainer");
     const library = window.LightweightCharts;
     const candles = normalizeDailyCandles(points);
@@ -1216,8 +1956,81 @@ function renderProfessionalDailyChart(points) {
     chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.08, bottom: 0.28 } });
     chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
     chart.timeScale().fitContent();
-    bindDailyChartCrosshair(chart, candleSeries, points, container);
     state.dailyChart = chart;
+    bindDailyChartCrosshair(chart, candleSeries, container);
+    subscribeDailyChartHistoryLoading(chart, { candleSeries, ma5Series, ma10Series, volumeSeries }, symbol);
+}
+
+function subscribeDailyChartHistoryLoading(chart, chartSeries, symbol) {
+    chart.timeScale().subscribeVisibleLogicalRangeChange((logicalRange) => {
+        if (!logicalRange || logicalRange.from > 12 || state.dailyChart !== chart) return;
+        loadOlderDailyChartHistory(chart, chartSeries, symbol);
+    });
+}
+
+async function loadOlderDailyChartHistory(chart, chartSeries, symbol) {
+    if (state.dailyChartHistoryLoading || state.dailyChartHistoryExhausted || state.dailyChart !== chart) return;
+    const currentCandles = normalizeDailyCandles(state.dailyChartPoints);
+    if (!currentCandles.length) return;
+    const requestId = state.dailyChartRequestId;
+    const earliestDate = currentCandles[0].time;
+    state.dailyChartHistoryLoading = true;
+    updateDailyChartSourceText("正在加载更早日线…");
+    try {
+        const path = `/api/klines/${encodeURIComponent(symbol)}?period=D&before=${encodeURIComponent(earliestDate)}&months=24&limit=260&ensure=1`;
+        const data = await api(path);
+        if (requestId !== state.dailyChartRequestId || state.dailyChart !== chart || state.dailyChartSymbol !== symbol) return;
+        const olderPoints = data.items || [];
+        state.dailyChartHistoryExhausted = !data.has_more || !olderPoints.length;
+        if (!olderPoints.length) {
+            updateDailyChartSourceText("已到最早可用日线");
+            return;
+        }
+        const visibleRange = chart.timeScale().getVisibleLogicalRange();
+        const previousLength = currentCandles.length;
+        state.dailyChartPoints = mergeDailyPoints(olderPoints, state.dailyChartPoints);
+        updateDailyChartDetailMap(state.dailyChartPoints);
+        const candles = normalizeDailyCandles(state.dailyChartPoints);
+        const addedCount = candles.length - previousLength;
+        if (addedCount <= 0) {
+            state.dailyChartHistoryExhausted = true;
+            updateDailyChartSourceText("已到最早可用日线");
+            return;
+        }
+        chartSeries.candleSeries.setData(candles);
+        chartSeries.ma5Series.setData(movingAverageSeries(candles, 5));
+        chartSeries.ma10Series.setData(movingAverageSeries(candles, 10));
+        chartSeries.volumeSeries.setData(dailyVolumeSeries(candles));
+        if (visibleRange) {
+            // 历史数据前插后补偿逻辑索引，避免当前查看的右侧日线发生跳动。
+            chart.timeScale().setVisibleLogicalRange({ from: visibleRange.from + addedCount, to: visibleRange.to + addedCount });
+        }
+        updateDailyChartSourceText(`已加载 ${candles.length} 个交易日`);
+    } catch (error) {
+        updateDailyChartSourceText("历史日线加载失败，可再次缩放重试");
+    } finally {
+        if (requestId === state.dailyChartRequestId) state.dailyChartHistoryLoading = false;
+    }
+}
+
+function dailyVolumeSeries(candles) {
+    const styles = getComputedStyle(document.documentElement);
+    const red = styles.getPropertyValue("--red").trim();
+    const green = styles.getPropertyValue("--green").trim();
+    return candles.map((item) => ({
+        time: item.time, value: item.vol || 0, color: colorWithAlpha(item.close >= item.open ? red : green, 0.55),
+    }));
+}
+
+function updateDailyChartDetailMap(points) {
+    state.dailyChartDetailByDate = new Map(points.map((item) => [String(item.trade_time || "").slice(0, 10), item]));
+}
+
+function updateDailyChartSourceText(suffix) {
+    const data = state.dailyChartSourceData || {};
+    const cacheState = data.has_ohlcv ? "OHLCV已缓存" : "OHLCV数据不完整";
+    const sourceText = `${sourceDisplayName(data.source)} · ${state.dailyChartPoints.length} 个交易日 · ${cacheState}`;
+    document.getElementById("dailyChartSource").textContent = `${sourceText} · ${suffix}`;
 }
 
 function dailyChartThemeOptions() {
@@ -1261,8 +2074,7 @@ function movingAverageSeries(candles, windowSize) {
     return result;
 }
 
-function bindDailyChartCrosshair(chart, candleSeries, points, container) {
-    const detailByDate = new Map(points.map((item) => [String(item.trade_time || "").slice(0, 10), item]));
+function bindDailyChartCrosshair(chart, candleSeries, container) {
     const tooltip = document.createElement("div");
     tooltip.className = "daily-chart-tooltip";
     tooltip.hidden = true;
@@ -1270,7 +2082,7 @@ function bindDailyChartCrosshair(chart, candleSeries, points, container) {
     chart.subscribeCrosshairMove((param) => {
         const candle = param.seriesData.get(candleSeries);
         const date = chartTimeKey(param.time);
-        const detail = detailByDate.get(date);
+        const detail = state.dailyChartDetailByDate.get(date);
         if (!candle || !detail || !param.point) {
             tooltip.hidden = true;
             return;
@@ -1553,6 +2365,62 @@ async function saveDatabaseSettings(event) {
     }
 }
 
+async function loadMaintenanceSettings() {
+    const status = document.getElementById("maintenanceSettingsState");
+    status.className = "status-pill running";
+    status.textContent = "正在读取";
+    try {
+        const data = await api("/api/settings/data-maintenance");
+        state.maintenanceSettings = data;
+        renderMaintenanceSettings(data);
+    } catch (error) {
+        status.className = "status-pill failed";
+        status.textContent = "读取失败";
+        toast(error.message, true);
+    }
+}
+
+function renderMaintenanceSettings(data) {
+    const input = document.getElementById("minuteKlineRetentionDays");
+    const button = document.getElementById("saveMaintenanceSettings");
+    input.value = data.minute_kline_retention_days || 2;
+    input.min = data.minimum_retention_days || 2;
+    input.max = data.maximum_retention_days || 3650;
+    input.disabled = false;
+    button.disabled = false;
+    document.getElementById("maintenanceSettingsState").className = "status-pill completed";
+    document.getElementById("maintenanceSettingsState").textContent = "已启用";
+    document.getElementById("maintenanceSettingsHint").textContent = "保存后会立即执行一次分钟数据清理；历史日线不会删除。";
+}
+
+async function saveMaintenanceSettings(event) {
+    event.preventDefault();
+    const input = document.getElementById("minuteKlineRetentionDays");
+    const retentionDays = Number(input.value);
+    if (!Number.isInteger(retentionDays)) {
+        toast("分钟K线保留时间必须是整数", true);
+        return;
+    }
+    const button = document.getElementById("saveMaintenanceSettings");
+    button.disabled = true;
+    button.textContent = "正在保存…";
+    try {
+        const data = await api("/api/settings/data-maintenance", {
+            method: "POST",
+            body: JSON.stringify({ minute_kline_retention_days: retentionDays }),
+        });
+        state.maintenanceSettings = data;
+        renderMaintenanceSettings(data);
+        const deletedCount = Number(data.deleted_minute_bars || 0);
+        toast(deletedCount ? `设置已保存，并清理 ${formatNumber(deletedCount)} 条过期分钟K线` : "设置已保存，没有需要清理的分钟K线");
+    } catch (error) {
+        toast(error.message, true);
+    } finally {
+        button.disabled = false;
+        button.textContent = "保存并清理";
+    }
+}
+
 function renderRunRows(items) {
     const rows = document.getElementById("runRows");
     const supportsErrorModal = Boolean(document.getElementById("errorModal"));
@@ -1644,12 +2512,13 @@ async function deleteTaskRun(runId, button) {
 function renderTasks(tasks, latestScan) {
     state.tasks = tasks;
     const definitions = [
-        ["refresh_stocks", "股票列表刷新", "更新SQLite中的证券主数据快照"],
-        ["refresh_etfs", "ETF列表刷新", "更新SQLite中的ETF主数据快照"],
-        ["scan_market", "全市场策略扫描", "逐只计算所有启用的策略指标"],
-        ["retry_errors", "错误标的重试", "只重新处理扫描失败的标的列表"],
+        ["refresh_stocks", "refresh-stocks", "股票列表刷新", "更新SQLite中的证券主数据快照"],
+        ["refresh_etfs", "refresh-etfs", "ETF列表刷新", "更新SQLite中的ETF主数据快照"],
+        ["scan_market", "scan", "全市场策略扫描", "逐只计算所有启用的策略指标"],
+        ["retry_errors", "retry-errors", "错误标的重试", "只重新处理最近扫描中尚未解决的失败标的"],
     ];
-    document.getElementById("taskCards").innerHTML = definitions.map(([key, title, description]) => {
+    const taskCards = document.getElementById("taskCards");
+    taskCards.innerHTML = definitions.map(([key, action, title, description]) => {
         const task = tasks[key] || { status: "idle" };
         let progress = task.status === "completed" ? 100 : 0;
         if (key === "scan_market" && ["running", "paused"].includes(latestScan?.status) && latestScan.total_stocks) {
@@ -1657,12 +2526,18 @@ function renderTasks(tasks, latestScan) {
         }
         const indeterminate = task.status === "running" && key !== "scan_market";
         const progressCopy = taskProgressCopy(key, task, latestScan, progress);
-        return `<article class="card task-card"><div class="task-card-head"><h3>${title}</h3>
+        const cardState = taskCardState(key, tasks, latestScan);
+        return `<button class="card task-card task-trigger" data-task-trigger="${action}" data-run-id="${latestScan?.id || ""}"
+            data-error-count="${latestScan?.error_count || 0}" type="button" ${cardState.disabled ? "disabled" : ""}
+            aria-label="${escapeHtml(cardState.actionLabel)}"><div class="task-card-head"><h3>${title}</h3>
             <span class="status-pill ${task.status}">${statusLabel(task.status)}</span></div><p>${description}</p>
             <div class="progress-track ${task.status} ${indeterminate ? "indeterminate" : ""}">
             <span style="width:${progress}%"></span></div>
-            <p>${progressCopy}</p></article>`;
+            <p>${progressCopy}</p><span class="task-card-action">${escapeHtml(cardState.actionLabel)}</span></button>`;
     }).join("");
+    taskCards.querySelectorAll("[data-task-trigger]").forEach((card) => {
+        card.addEventListener("click", () => triggerTaskCard(card));
+    });
     const scanRunning = ["running", "paused"].includes(tasks.scan_market?.status);
     const refreshRunning = tasks.refresh_stocks?.status === "running";
     const refreshEtfsRunning = tasks.refresh_etfs?.status === "running";
@@ -1678,6 +2553,55 @@ function renderTasks(tasks, latestScan) {
     });
     const retryButton = document.getElementById("retryErrorsButton");
     if (retryButton && state.errorDetail) retryButton.disabled = retryRunning || !state.errorDetail.can_retry;
+}
+
+function taskCardState(key, tasks, latestScan) {
+    const active = (taskName) => ["running", "paused"].includes(tasks[taskName]?.status);
+    const blockers = {
+        refresh_stocks: ["refresh_stocks", "refresh_etfs", "scan_market", "retry_errors"],
+        refresh_etfs: ["refresh_etfs", "refresh_stocks", "scan_market", "retry_errors"],
+        scan_market: ["scan_market", "refresh_stocks", "refresh_etfs", "retry_errors"],
+        retry_errors: ["retry_errors", "refresh_stocks", "refresh_etfs"],
+    }[key];
+    const blocked = blockers.some(active);
+    if (active(key)) return { disabled: true, actionLabel: tasks[key].status === "paused" ? "请在任务队列中继续" : "任务执行中" };
+    if (blocked) return { disabled: true, actionLabel: "等待当前任务结束" };
+    if (key === "retry_errors") {
+        const errorCount = Number(latestScan?.error_count || 0);
+        return errorCount > 0 && latestScan?.id
+            ? { disabled: false, actionLabel: `重试 ${errorCount} 个失败标的 →` }
+            : { disabled: true, actionLabel: "暂无可重试错误" };
+    }
+    const labels = { refresh_stocks: "立即刷新股票库 →", refresh_etfs: "立即刷新ETF库 →", scan_market: "启动全市场扫描 →" };
+    return { disabled: false, actionLabel: labels[key] };
+}
+
+function triggerTaskCard(card) {
+    const action = card.dataset.taskTrigger;
+    if (action === "retry-errors") {
+        startLatestErrorRetry(Number(card.dataset.runId), Number(card.dataset.errorCount));
+        return;
+    }
+    startTask(action);
+}
+
+async function startLatestErrorRetry(runId, errorCount) {
+    if (!runId || !errorCount) return;
+    const confirmed = await confirmAction({
+        title: "重试最近扫描错误",
+        message: `将为扫描任务 #${runId} 中的 ${errorCount} 个失败标的创建独立重试任务。`,
+        confirmText: "开始重试",
+        tone: "primary",
+    });
+    if (!confirmed) return;
+    try {
+        const data = await api(`/api/scan-runs/${runId}/retry-errors`, { method: "POST", body: "{}" });
+        state.tasks.retry_errors = data.task;
+        toast("失败标的重试已加入任务队列");
+        scheduleTaskPoll(0, true);
+    } catch (error) {
+        toast(error.message, true);
+    }
 }
 
 function taskProgressCopy(key, task, latestScan, progress) {
@@ -1946,6 +2870,12 @@ function formatTime(value) {
     if (!value) return "—";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function formatClock(value) {
+    if (!value) return "—";
+    const text = String(value);
+    return text.length >= 16 ? text.slice(11, 16) : text;
 }
 
 function formatListDate(value) {

@@ -25,7 +25,7 @@ a-stock-monitor = "etf_monitor.etf_monitor_scheduler:main"
 a-stock-web = "web_app.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["common*", "etf_monitor*", "market_data*", "stock_signal_monitor*", "web_app*"]
+include = ["etf_monitor*", "infrastructure*", "market_data*", "stock_signal_monitor*", "web_app*"]
 
 [tool.setuptools.package-data]
 web_app = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/vendor/tabler/*"]

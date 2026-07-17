@@ -31,6 +31,13 @@ class TradingCalendarTest(unittest.TestCase):
         expected = latest_expected_bar_time("15min", datetime(2026, 7, 14, 14, 36, 0))
         self.assertEqual(datetime(2026, 7, 14, 14, 30, 0), expected)
 
+    def test_latest_bar_waits_for_close_safety_buffer(self):
+        before_safe_time = latest_expected_bar_time("15min", datetime(2026, 7, 14, 14, 30, 9))
+        at_safe_time = latest_expected_bar_time("15min", datetime(2026, 7, 14, 14, 30, 10))
+
+        self.assertEqual(datetime(2026, 7, 14, 14, 15, 0), before_safe_time)
+        self.assertEqual(datetime(2026, 7, 14, 14, 30, 0), at_safe_time)
+
 
 if __name__ == "__main__":
     unittest.main()

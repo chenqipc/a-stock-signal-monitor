@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from common.StockEnum import StockStatus
+import pandas as pd
+
+from stock_signal_monitor.stock_status import StockStatus
 from market_data.database import MarketDataDatabase
 from tests.test_market_data import sample_bars, sample_etf_list, sample_stock_list
 from web_app.app import create_app
@@ -66,6 +68,36 @@ class FakeTaskManager:
         return True, self.tasks[name]
 
 
+class FakeRealtimeMonitor:
+    """模拟页面控制的实时线程，Web接口测试不访问外部行情。"""
+
+    def __init__(self):
+        self.status = {
+            "status": "stopped",
+            "started_at": None,
+            "stopped_at": None,
+            "last_scan_at": None,
+            "current_period": None,
+            "last_error": None,
+            "next_runs": {},
+            "intervals": {"15min": 7, "30min": 15, "60min": 30, "120min": 60},
+        }
+
+    def get_status(self):
+        return dict(self.status)
+
+    def start(self):
+        self.status["status"] = "running"
+        return self.get_status()
+
+    def stop(self):
+        self.status["status"] = "stopped"
+        return self.get_status()
+
+    def close(self):
+        self.stop()
+
+
 class WebAppTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -78,10 +110,12 @@ class WebAppTest(unittest.TestCase):
         self.database.finish_scan_run(self.run_id, "completed", 2, 1, 1)
         self.settings_path = Path(self.temp_dir.name) / "app_settings.json"
         self.task_manager = FakeTaskManager()
+        self.realtime_monitor = FakeRealtimeMonitor()
         self.app = create_app(
             {"TESTING": True, "DATABASE_SETTINGS_PATH": self.settings_path},
             database=self.database,
             task_manager=self.task_manager,
+            realtime_monitor=self.realtime_monitor,
         )
         self.client = self.app.test_client()
 
@@ -102,32 +136,45 @@ class WebAppTest(unittest.TestCase):
         self.assertNotIn("策略信号中心", page)
         self.assertNotIn("任务中心", page)
         self.assertIn('data-view-target="etfs"', page)
-        self.assertIn('data-view-target="settings"', page)
+        self.assertIn('data-view-target="settings-database"', page)
+        self.assertIn('data-view-target="settings-maintenance"', page)
         self.assertIn('data-view-target="daily-custom"', page)
         self.assertIn('data-view-target="daily-other"', page)
         self.assertIn('data-view-target="minute-custom"', page)
         self.assertIn('data-view-target="minute-other"', page)
         self.assertIn('data-nav-collapse="daily"', page)
-        self.assertIn('data-nav-collapse="minute"', page)
-        self.assertEqual(2, page.count('aria-expanded="false"'))
-        self.assertEqual(2, page.count('class="nav-subitems" hidden'))
+        self.assertIn('data-nav-collapse="realtime"', page)
+        self.assertNotIn('data-nav-collapse="minute"', page)
+        self.assertEqual(3, page.count('aria-expanded="false"'))
+        self.assertEqual(3, page.count('class="nav-subitems" hidden'))
         self.assertIn('id="databaseSettingsForm"', page)
+        self.assertIn('id="maintenanceSettingsForm"', page)
+        self.assertIn('id="minuteKlineRetentionDays"', page)
         self.assertIn('id="stockGroupTabs"', page)
         self.assertIn('id="etfGroupTabs"', page)
         self.assertIn('id="view-minute-custom"', page)
-        self.assertIn("ETF分钟级自定义策略", page)
-        self.assertIn("日线策略", page)
-        self.assertIn("分钟级策略", page)
+        self.assertIn("ETF实时监控池", page)
+        self.assertIn('id="realtimeEtfSearch"', page)
+        self.assertIn('id="startRealtimeMonitor"', page)
+        self.assertIn("日线策略信号", page)
+        self.assertIn("实时策略信号", page)
+        self.assertNotIn("分钟级策略", page)
         self.assertIn('id="indexTrendChart"', page)
         self.assertIn("主要指数走势", page)
         self.assertNotIn("把分散的指标", page)
         self.assertNotIn("ETF主数据", page)
         self.assertNotIn("股票主数据", page)
         self.assertEqual(2, page.count("danger-action is-placeholder"))
-        self.assertEqual(5, page.count('class="app-modal-backdrop"'))
+        self.assertEqual(6, page.count('class="app-modal-backdrop"'))
         self.assertIn('id="confirmModal"', page)
         self.assertIn('id="dailyChartModal"', page)
         self.assertIn('id="dailyPreviewPopover"', page)
+        self.assertIn('id="minutePreviewPopover"', page)
+        self.assertIn('class="preview-ma-legend"', page)
+        self.assertIn('class="signal-dot insufficient-data"', page)
+        self.assertIn('id="minuteChartModal"', page)
+        self.assertIn('id="minuteChartPeriodSwitcher"', page)
+        self.assertEqual(5, page.count("data-minute-chart-period="))
         self.assertEqual(2, page.count("data-signal-asset="))
         self.assertIn("vendor/lightweight-charts/lightweight-charts.standalone.production.js", page)
         self.assertIn("Charts by TradingView", page)
@@ -135,6 +182,18 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('if (viewName === "signals") viewName = "daily-custom";', script)
         self.assertIn("function toggleNavGroup", script)
         self.assertIn("function syncStrategyNav", script)
+        self.assertIn("function loadMaintenanceSettings", script)
+        self.assertIn("function realtimePeriodSummary", script)
+        self.assertIn("function toggleRealtimeDirection", script)
+        self.assertIn("function realtimeStateHasInsufficientData", script)
+        self.assertIn("function renderCompactRealtimeCards", script)
+        self.assertIn("function renderProfessionalMinuteChart", script)
+        self.assertIn("function switchMinuteChartPeriod", script)
+        self.assertIn('params.set("ensure", "1")', script)
+        self.assertIn("function saveMaintenanceSettings", script)
+        self.assertIn("function triggerTaskCard", script)
+        self.assertIn("function startLatestErrorRetry", script)
+        self.assertIn('data-task-trigger="${action}"', script)
         self.assertNotIn("window.confirm", script)
         self.assertIn("vendor/tabler/tabler.min.css", page)
         self.assertIn('data-bs-theme="dark"', page)
@@ -147,6 +206,8 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(3, page.count('class="signal-table-toolbar'))
         self.assertIn("strategy-filter-card", script)
         self.assertIn("function renderProfessionalDailyChart", script)
+        self.assertIn("function loadOlderDailyChartHistory", script)
+        self.assertIn("subscribeDailyChartHistoryLoading", script)
         self.assertIn("function renderDailyPreviewCandles", script)
         self.assertIn("function drawIndexChart", script)
         self.assertNotIn("library.AreaSeries", script)
@@ -156,6 +217,9 @@ class WebAppTest(unittest.TestCase):
         self.assertIn('class="index-ma-legend"', page)
         self.assertIn("indexMovingAverageOptions", script)
         self.assertIn("movingAverageSeries(candles, 60)", script)
+        self.assertIn('minuteMovingAverageSeries(candles, "ma60", 60)', script)
+        self.assertGreaterEqual(script.count('minuteMovingAverageSeries(candles, "ma60", 60)'), 2)
+        self.assertIn("tickMarkFormatter: formatMinuteChartTick", script)
         self.assertIn("subscribeVisibleLogicalRangeChange", script)
         self.assertIn("function loadOlderIndexHistory", script)
         self.assertIn("rightBarStaysOnScroll: true", script)
@@ -257,6 +321,25 @@ class WebAppTest(unittest.TestCase):
         indicator_counts = {item["label"]: item["count"] for item in etfs["indicators"]}
         self.assertEqual(1, indicator_counts[StockStatus.SUPPORT_LEVEL_REBOUND.value])
 
+    def test_minute_kline_endpoint_returns_cached_ohlcv_for_realtime_chart(self):
+        minute = sample_bars()
+        minute["trade_time"] = pd.to_datetime(["2026-07-17 10:30", "2026-07-17 10:45"])
+        minute["ma10"] = [1.1, 1.2]
+        minute["ma30"] = [1.0, 1.1]
+        minute["ma60"] = [0.9, 1.0]
+        self.database.save_klines("510300.SH", "15min", minute, "sina")
+
+        response = self.client.get("/api/klines/510300.SH?period=15min&limit=2")
+        payload = response.get_json()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("15min", payload["period"])
+        self.assertEqual(2, len(payload["items"]))
+        self.assertEqual("2026-07-17 10:45:00", payload["items"][-1]["trade_time"])
+        self.assertEqual(1.0, payload["items"][-1]["ma60"])
+        self.assertTrue(payload["has_ohlcv"])
+        self.assertTrue(payload["has_volume"])
+
     def test_etf_list_and_independent_group_workflow(self):
         create_response = self.client.post("/api/instrument-groups", json={"asset_type": "etf", "name": "ETF自选"})
         group_id = create_response.get_json()["group"]["id"]
@@ -274,6 +357,30 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual("510300.SH", etfs["items"][0]["ts_code"])
         self.assertEqual(1, etfs["items"][0]["is_pinned"])
         self.assertEqual("ETF自选", etfs["groups"][0]["name"])
+
+    def test_realtime_monitor_pool_can_add_start_stop_and_remove_etf(self):
+        added = self.client.post(
+            "/api/realtime-monitor/watchlist",
+            json={"symbol": "510300.SH", "asset_type": "etf"},
+        )
+        listed = self.client.get("/api/realtime-monitor")
+        started = self.client.post("/api/realtime-monitor/start", json={})
+        stopped = self.client.post("/api/realtime-monitor/stop", json={})
+        removed = self.client.delete("/api/realtime-monitor/watchlist/510300.SH")
+
+        self.assertEqual(201, added.status_code)
+        self.assertEqual("510300.SH", listed.get_json()["items"][0]["symbol"])
+        self.assertEqual("running", started.get_json()["manager"]["status"])
+        self.assertEqual("stopped", stopped.get_json()["manager"]["status"])
+        self.assertEqual(200, removed.status_code)
+        self.assertEqual([], removed.get_json()["realtime"]["items"])
+
+    def test_etf_search_marks_realtime_monitored_items(self):
+        self.database.add_realtime_monitor("510300.SH", "etf")
+
+        payload = self.client.get("/api/etfs?q=510300").get_json()
+
+        self.assertEqual(1, payload["items"][0]["is_monitored"])
 
     def test_stock_group_item_can_be_removed_and_group_deleted(self):
         group = self.client.post("/api/instrument-groups", json={"asset_type": "stock", "name": "自选"}).get_json()["group"]
@@ -384,6 +491,65 @@ class WebAppTest(unittest.TestCase):
         self.assertIn("运行中的任务", response.get_json()["error"])
         self.assertFalse(self.settings_path.exists())
 
+    def test_data_maintenance_setting_is_saved_and_prunes_only_old_minute_bars(self):
+        minute = pd.DataFrame(
+            {
+                "trade_time": pd.date_range("2026-05-07 10:00", periods=70, freq="D"),
+                "close": [10.0] * 70,
+            }
+        )
+        self.database.save_klines("000001.SZ", "15min", minute, "seed")
+        self.database.save_klines("000001.SZ", "D", sample_bars(), "seed")
+
+        response = self.client.post(
+            "/api/settings/data-maintenance",
+            json={"minute_kline_retention_days": 2},
+        )
+        payload = response.get_json()
+        saved_settings = self.settings_path.read_text(encoding="utf-8")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, payload["minute_kline_retention_days"])
+        self.assertEqual(8, payload["deleted_minute_bars"])
+        self.assertIn('"minute_kline_retention_days": 2', saved_settings)
+        self.assertEqual(62, len(self.database.load_klines("000001.SZ", "15min")))
+        self.assertEqual(2, len(self.database.load_klines("000001.SZ", "D")))
+
+    def test_data_maintenance_setting_ignores_removed_environment_variable(self):
+        with patch.dict("os.environ", {"MINUTE_KLINE_RETENTION_DAYS": "365"}):
+            response = self.client.get("/api/settings/data-maintenance")
+            payload = response.get_json()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, payload["minute_kline_retention_days"])
+        self.assertNotIn("managed_by_environment", payload)
+
+    def test_database_and_maintenance_settings_are_merged_in_same_file(self):
+        target_directory = Path(self.temp_dir.name) / "shared-settings"
+        maintenance = self.client.post(
+            "/api/settings/data-maintenance",
+            json={"minute_kline_retention_days": 180},
+        )
+        database = self.client.post(
+            "/api/settings/database",
+            json={"database_directory": str(target_directory), "copy_current": True, "cloud_sync_mode": False},
+        )
+        content = self.settings_path.read_text(encoding="utf-8")
+
+        self.assertEqual(200, maintenance.status_code)
+        self.assertEqual(200, database.status_code)
+        self.assertIn('"minute_kline_retention_days": 180', content)
+        self.assertIn(str(target_directory.resolve()), content)
+
+    def test_data_maintenance_rejects_out_of_range_days(self):
+        response = self.client.post(
+            "/api/settings/data-maintenance",
+            json={"minute_kline_retention_days": 1},
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("2到3650", response.get_json()["error"])
+
     def test_scan_error_detail_and_retry_endpoint(self):
         detail = self.client.get(f"/api/scan-runs/{self.run_id}/errors").get_json()
         retry_response = self.client.post(f"/api/scan-runs/{self.run_id}/retry-errors", json={})
@@ -427,9 +593,29 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual("eastmoney", payload["source"])
         self.assertTrue(payload["has_volume"])
         self.assertTrue(payload["has_ohlcv"])
+        self.assertTrue(payload["has_more"])
         self.assertEqual(2, len(payload["items"]))
         self.assertEqual(1000, payload["items"][0]["vol"])
         fetch.assert_called_once()
+
+    def test_daily_chart_endpoint_pages_cached_history_before_cursor(self):
+        bars = sample_bars()
+        bars["trade_time"] = pd.to_datetime(["2026-06-10", "2026-07-10"])
+        self.database.save_klines("000001.SZ", "D", bars, "seed")
+
+        response = self.client.get("/api/klines/000001.SZ?period=D&before=2026-07-01&months=12&limit=120")
+        payload = response.get_json()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(payload["items"]))
+        self.assertEqual("2026-06-10 00:00:00", payload["items"][0]["trade_time"])
+        self.assertTrue(all(item["trade_time"] < "2026-07-01" for item in payload["items"]))
+
+    def test_daily_chart_endpoint_rejects_invalid_history_cursor(self):
+        response = self.client.get("/api/klines/000001.SZ?period=D&before=not-a-date")
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("before", response.get_json()["error"])
 
     def test_stock_refresh_is_blocked_while_market_scan_is_running(self):
         manager = TaskManager()

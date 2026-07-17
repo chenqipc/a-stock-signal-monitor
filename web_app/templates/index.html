@@ -28,25 +28,22 @@
                 <button class="nav-item active" data-view-target="overview" type="button">
                     <span class="nav-icon">⌂</span><span>监控总览</span>
                 </button>
-                <div class="nav-section">
-                    <div class="nav-section-title"><span class="nav-icon">◇</span><span>策略信号</span></div>
-                    <div class="nav-subgroup" data-nav-group="daily">
-                        <button class="nav-subgroup-toggle" data-nav-collapse="daily" type="button" aria-expanded="false">
-                            <span>日线策略</span><i aria-hidden="true">›</i>
-                        </button>
-                        <div class="nav-subitems" hidden>
-                            <button class="nav-item nav-child" data-view-target="daily-custom" type="button">自定义策略</button>
-                            <button class="nav-item nav-child" data-view-target="daily-other" type="button">其他策略</button>
-                        </div>
+                <div class="nav-section strategy-nav-section" data-nav-group="daily">
+                    <button class="nav-section-title nav-section-toggle" data-nav-collapse="daily" type="button" aria-expanded="false">
+                        <span class="nav-icon">◇</span><span>日线策略信号</span><i aria-hidden="true">›</i>
+                    </button>
+                    <div class="nav-subitems" hidden>
+                        <button class="nav-item nav-child" data-view-target="daily-custom" type="button">自定义策略</button>
+                        <button class="nav-item nav-child" data-view-target="daily-other" type="button">其他策略</button>
                     </div>
-                    <div class="nav-subgroup" data-nav-group="minute">
-                        <button class="nav-subgroup-toggle" data-nav-collapse="minute" type="button" aria-expanded="false">
-                            <span>分钟级策略</span><i aria-hidden="true">›</i>
-                        </button>
-                        <div class="nav-subitems" hidden>
-                            <button class="nav-item nav-child" data-view-target="minute-custom" type="button">自定义策略</button>
-                            <button class="nav-item nav-child" data-view-target="minute-other" type="button">其他策略</button>
-                        </div>
+                </div>
+                <div class="nav-section strategy-nav-section" data-nav-group="realtime">
+                    <button class="nav-section-title nav-section-toggle" data-nav-collapse="realtime" type="button" aria-expanded="false">
+                        <span class="nav-icon">⌁</span><span>实时策略信号</span><i aria-hidden="true">›</i>
+                    </button>
+                    <div class="nav-subitems" hidden>
+                        <button class="nav-item nav-child" data-view-target="minute-custom" type="button">自定义策略</button>
+                        <button class="nav-item nav-child" data-view-target="minute-other" type="button">其他策略</button>
                     </div>
                 </div>
                 <button class="nav-item" data-view-target="stocks" type="button">
@@ -58,9 +55,18 @@
                 <button class="nav-item" data-view-target="runs" type="button">
                     <span class="nav-icon">↻</span><span>任务记录</span>
                 </button>
-                <button class="nav-item" data-view-target="settings" type="button">
-                    <span class="nav-icon">⚙</span><span>系统设置</span>
-                </button>
+                <div class="nav-section">
+                    <div class="nav-section-title"><span class="nav-icon">⚙</span><span>系统设置</span></div>
+                    <div class="nav-subgroup" data-nav-group="settings">
+                        <button class="nav-subgroup-toggle" data-nav-collapse="settings" type="button" aria-expanded="false">
+                            <span>设置模块</span><i aria-hidden="true">›</i>
+                        </button>
+                        <div class="nav-subitems" hidden>
+                            <button class="nav-item nav-child" data-view-target="settings-database" type="button">数据库存储</button>
+                            <button class="nav-item nav-child" data-view-target="settings-maintenance" type="button">数据维护</button>
+                        </div>
+                    </div>
+                </div>
             </nav>
 
             <div class="sidebar-foot">
@@ -194,26 +200,47 @@
             </section>
 
             <section class="view" id="view-minute-custom" data-view="minute-custom">
-                <article class="card panel watch-panel strategy-watch-panel">
-                    <div class="panel-head">
-                        <div><p class="panel-kicker">MINUTE STRATEGIES</p><h3>ETF分钟级自定义策略</h3></div>
-                        <span class="live-pill">分钟线</span>
-                    </div>
-                    <p class="panel-description">当前分钟级策略来自持续扫描的ETF监控池，后续可从ETF列表选择标的加入监控。</p>
-                    <div class="watch-layout">
-                        <div class="watchlist" id="watchlist"><div class="empty-state">正在加载ETF…</div></div>
-                        <div class="chart-box">
-                            <div class="chart-caption"><strong id="chartTitle">选择ETF查看走势</strong><span id="chartMeta">本地缓存K线</span></div>
-                            <canvas id="priceChart" width="720" height="260" aria-label="ETF价格走势图"></canvas>
+                <article class="card panel realtime-monitor-panel">
+                    <div class="panel-head realtime-monitor-head">
+                        <div>
+                            <p class="panel-kicker">REALTIME SIGNALS</p><h3>ETF实时监控池</h3>
+                            <p class="panel-description">分钟行情串行采集，自动切换免费行情源；穿越状态和最近错误均保存到数据库。</p>
                         </div>
+                        <div class="realtime-head-controls">
+                            <div class="realtime-search-wrap">
+                                <label class="search-field realtime-search-field"><span>⌕</span>
+                                    <input class="form-control" id="realtimeEtfSearch" type="search" placeholder="搜索ETF并加入监控">
+                                </label>
+                                <div class="realtime-search-results" id="realtimeSearchResults" hidden></div>
+                            </div>
+                            <div class="realtime-monitor-actions">
+                                <span class="live-pill" id="realtimeMonitorState">未启动</span>
+                                <span class="realtime-monitor-meta" id="realtimeMonitorMeta">尚未执行扫描</span>
+                                <button class="btn primary-button compact" id="startRealtimeMonitor" type="button">启动监控</button>
+                                <button class="btn secondary-button compact" id="stopRealtimeMonitor" type="button" disabled>停止</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="realtime-intervals" id="realtimeIntervals" aria-label="扫描周期说明"></div>
+                    <div class="realtime-status-legend">
+                        <span><i class="signal-dot cross-up"></i>上穿</span><span><i class="signal-dot cross-down"></i>下穿</span>
+                        <span><i class="signal-dot cross-none"></i>无穿越</span><span><i class="signal-dot insufficient-data"></i>样本不足</span>
+                        <span><i class="signal-dot above-all"></i>位于三条均线上方</span>
+                        <strong class="realtime-filter-summary" id="realtimeFilterSummary">四周期总览</strong>
+                    </div>
+                    <div class="realtime-monitor-cards" id="realtimeMonitorCards">
+                        <div class="empty-state">正在读取监控池…</div>
+                    </div>
+                    <div class="realtime-source-note">
+                        <strong>实时源：</strong>新浪财经优先，东方财富失败兜底；网络均不可用时保留数据库中的最近成功状态。
                     </div>
                 </article>
             </section>
 
             <section class="view" id="view-minute-other" data-view="minute-other">
                 <article class="card panel placeholder-panel">
-                    <p class="panel-kicker">MINUTE STRATEGIES</p><h3>分钟级其他策略</h3>
-                    <p class="panel-description">这里预留给非自定义来源的分钟级策略，当前暂无启用策略。</p>
+                    <p class="panel-kicker">REALTIME SIGNALS</p><h3>其他实时策略</h3>
+                    <p class="panel-description">这里预留给非自定义来源的实时策略，当前暂无启用策略。</p>
                 </article>
             </section>
 
@@ -309,7 +336,7 @@
                     <div class="panel-head">
                         <div>
                             <p class="panel-kicker">TASK QUEUE</p><h3>任务队列</h3>
-                            <p class="panel-description compact-description">扫描和错误重试都会生成独立任务；点击错误数量可查看详情。</p>
+                            <p class="panel-description compact-description">点击上方任务卡可启动任务；扫描和错误重试会生成独立记录。</p>
                         </div>
                         <div class="inline-actions">
                             <button class="btn secondary-button compact" data-action="refresh-stocks" type="button">刷新股票库</button>
@@ -328,7 +355,7 @@
                 </article>
             </section>
 
-            <section class="view" id="view-settings" data-view="settings">
+            <section class="view" id="view-settings-database" data-view="settings-database">
                 <article class="card panel settings-panel">
                     <div class="panel-head">
                         <div>
@@ -372,6 +399,42 @@
                     </form>
                 </article>
             </section>
+
+            <section class="view" id="view-settings-maintenance" data-view="settings-maintenance">
+                <article class="card panel settings-panel">
+                    <div class="panel-head">
+                        <div>
+                            <p class="panel-kicker">DATA RETENTION</p><h3>行情数据维护</h3>
+                            <p class="panel-description compact-description">控制分钟K线的基础保留时间；系统还会保留均线计算所需的最少样本，历史日线始终永久保留。</p>
+                        </div>
+                        <span class="status-pill completed" id="maintenanceSettingsState">正在读取</span>
+                    </div>
+                    <form class="settings-form" id="maintenanceSettingsForm">
+                        <label class="settings-field retention-settings-field" for="minuteKlineRetentionDays">
+                            <span>分钟K线保留时间</span>
+                            <div class="retention-input-row">
+                                <input class="form-control" id="minuteKlineRetentionDays" type="number" min="2" max="3650" step="1" required>
+                                <strong>天</strong>
+                            </div>
+                            <small>支持2到3650个交易日，并至少保留62根K线，确保有61根完整K线用于MA60穿越判断。</small>
+                        </label>
+                        <div class="settings-summary maintenance-summary">
+                            <div><span>日线数据</span><strong>永久保留</strong></div>
+                            <div><span>清理对象</span><strong>仅分钟K线</strong></div>
+                            <div><span>执行时机</span><strong>保存后及服务启动</strong></div>
+                        </div>
+                        <div class="cloud-sync-warning maintenance-notice">
+                            <strong>不会影响策略历史数据</strong>
+                            <p>日线策略依赖的历史K线不会被删除。分钟数据属于盘中监控缓存，
+                                过期后需要时可以从行情源重新获取。</p>
+                        </div>
+                        <div class="settings-actions">
+                            <span id="maintenanceSettingsHint">保存后会立即执行一次分钟数据清理。</span>
+                            <button class="btn primary-button compact" id="saveMaintenanceSettings" type="submit">保存并清理</button>
+                        </div>
+                    </form>
+                </article>
+            </section>
         </main>
     </div>
 
@@ -380,6 +443,57 @@
         <div class="daily-preview-chart" id="dailyPreviewChart" aria-label="近3个月蜡烛图预览"></div>
         <footer><span id="dailyPreviewMeta">正在读取本地缓存…</span><strong id="dailyPreviewChange">—</strong></footer>
     </aside>
+
+    <aside class="daily-preview-popover minute-preview-popover" id="minutePreviewPopover" hidden aria-live="polite">
+        <header>
+            <div><strong id="minutePreviewName">实时K线预览</strong><span id="minutePreviewSymbol"></span></div>
+            <small id="minutePreviewPeriod">15分钟</small>
+        </header>
+        <div class="preview-ma-legend" aria-label="均线图例">
+            <span><i class="legend-ma10"></i>MA10</span>
+            <span><i class="legend-ma30"></i>MA30</span>
+            <span><i class="legend-ma60"></i>MA60</span>
+        </div>
+        <div class="daily-preview-chart" id="minutePreviewChart" aria-label="分钟蜡烛图预览"></div>
+        <footer><span id="minutePreviewMeta">正在读取分钟K线缓存…</span><strong id="minutePreviewClose">—</strong></footer>
+    </aside>
+
+    <div class="modal-shell" id="minuteChartModal" hidden>
+        <button class="app-modal-backdrop" data-minute-chart-close type="button" aria-label="关闭实时K线详情"></button>
+        <section class="card modal-card daily-chart-modal-card" role="dialog" aria-modal="true" aria-labelledby="minuteChartTitle">
+            <header class="modal-head daily-chart-modal-head">
+                <div>
+                    <p class="panel-kicker">REALTIME MARKET CHART</p>
+                    <h2 id="minuteChartTitle">ETF实时K线</h2>
+                    <p id="minuteChartSubtitle">正在读取分钟K线缓存…</p>
+                </div>
+                <button class="btn modal-close" data-minute-chart-close type="button" aria-label="关闭">×</button>
+            </header>
+            <div class="daily-chart-modal-body">
+                <div class="kline-period-switcher" id="minuteChartPeriodSwitcher" role="tablist" aria-label="K线周期">
+                    <button class="active" data-minute-chart-period="15min" role="tab" aria-selected="true" type="button">15分钟</button>
+                    <button data-minute-chart-period="30min" role="tab" aria-selected="false" type="button">30分钟</button>
+                    <button data-minute-chart-period="60min" role="tab" aria-selected="false" type="button">60分钟</button>
+                    <button data-minute-chart-period="120min" role="tab" aria-selected="false" type="button">120分钟</button>
+                    <button data-minute-chart-period="D" role="tab" aria-selected="false" type="button">日线</button>
+                </div>
+                <div class="daily-chart-summary" id="minuteChartSummary"></div>
+                <div class="daily-chart-legend minute-chart-legend">
+                    <span><i class="legend-candle"></i>K线</span><span><i class="legend-ma10"></i>MA10</span>
+                    <span><i class="legend-ma30"></i>MA30</span><span><i class="legend-ma60"></i>MA60</span>
+                    <span><i class="legend-volume"></i>成交量</span>
+                </div>
+                <div class="daily-chart-container" id="minuteChartContainer"><div class="chart-loading">正在加载实时K线…</div></div>
+            </div>
+            <footer class="modal-actions daily-chart-footer">
+                <span id="minuteChartSource">数据读取自 SQLite 分钟缓存，监控运行时自动更新</span>
+                <div class="inline-actions">
+                    <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">Charts by TradingView</a>
+                    <button class="btn secondary-button" data-minute-chart-close type="button">关闭</button>
+                </div>
+            </footer>
+        </section>
+    </div>
 
     <div class="modal-shell" id="dailyChartModal" hidden>
         <button class="app-modal-backdrop" data-daily-chart-close type="button" aria-label="关闭日线详情"></button>

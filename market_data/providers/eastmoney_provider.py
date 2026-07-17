@@ -7,10 +7,11 @@ from urllib3.util.retry import Retry
 
 from market_data.config import ALLOW_INSECURE_HTTP_FALLBACK, HTTP_TIMEOUT_SECONDS, PROVIDER_MAX_RETRIES
 from market_data.exceptions import ProviderUnavailableError
+from market_data.periods import merge_a_share_60min_to_120min
 
 
 class EastMoneyProvider:
-    """获取沪深北证券日线和分钟线，并作为 BaoStock 的免费兜底。"""
+    """获取沪深北证券日线和分钟线，作为免费行情兜底。"""
 
     name = "eastmoney"
     supported_periods = {"D", "1min", "5min", "15min", "30min", "60min", "120min"}
@@ -106,7 +107,8 @@ class EastMoneyProvider:
             "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
             "klt": self._period_map[period],
-            "fqt": "1",
+            # 新浪分钟线为不复权口径，东方财富分钟兜底保持一致；日线仍使用前复权。
+            "fqt": "1" if period == "D" else "0",
             "secid": f"{market_id}.{code}",
             "beg": pd.Timestamp(start_date).strftime("%Y%m%d"),
             "end": pd.Timestamp(end_date).strftime("%Y%m%d"),
@@ -127,25 +129,7 @@ class EastMoneyProvider:
 
     @staticmethod
     def _merge_60min_to_120min(data):
-        if data is None or data.empty:
-            return data
-        result = data.copy().sort_values("trade_time")
-        result["trade_date"] = result["trade_time"].dt.date
-        result["group"] = result.groupby("trade_date").cumcount() // 2
-        result = result.groupby(["trade_date", "group"], as_index=False).agg(
-            trade_time=("trade_time", "max"),
-            open=("open", "first"),
-            close=("close", "last"),
-            high=("high", "max"),
-            low=("low", "min"),
-            vol=("vol", "sum"),
-            amount=("amount", "sum"),
-            pre_close=("pre_close", "first"),
-            pct_chg=("pct_chg", "sum"),
-            turnover_rate=("turnover_rate", "sum"),
-            is_st=("is_st", "max"),
-        )
-        return result.drop(columns=["trade_date", "group"])
+        return merge_a_share_60min_to_120min(data)
 
     def fetch_stock_list(self):
         urls = ["https://push2.eastmoney.com/api/qt/clist/get"]
@@ -198,19 +182,12 @@ class EastMoneyProvider:
     def _get_json(self, urls, params, description):
         errors = []
         for url in urls:
-            try:
-                response = self.session.get(url, params=params, timeout=self.timeout)
-                response.raise_for_status()
-                return response.json()
-            except requests.exceptions.ProxyError as exc:
-                errors.append(f"{url.split(':', 1)[0]}代理: {exc}")
+            for route, session in (("代理", self.session), ("直连", self.direct_session)):
                 try:
-                    # 环境代理失效不应拖垮免费兜底源，仅在代理异常时尝试直连。
-                    response = self.direct_session.get(url, params=params, timeout=self.timeout)
+                    # SOCKS依赖缺失、代理断连等异常都应继续尝试直连，避免环境代理拖垮兜底源。
+                    response = session.get(url, params=params, timeout=self.timeout)
                     response.raise_for_status()
                     return response.json()
-                except (requests.RequestException, ValueError) as direct_exc:
-                    errors.append(f"{url.split(':', 1)[0]}直连: {direct_exc}")
-            except (requests.RequestException, ValueError) as exc:
-                errors.append(f"{url.split(':', 1)[0]}: {exc}")
+                except (requests.RequestException, ValueError) as exc:
+                    errors.append(f"{url.split(':', 1)[0]}{route}: {exc}")
         raise ProviderUnavailableError(f"东方财富{description}请求失败: {'; '.join(errors)}")

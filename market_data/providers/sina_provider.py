@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 
 from market_data.config import HTTP_TIMEOUT_SECONDS, PROVIDER_MAX_RETRIES
 from market_data.exceptions import ProviderUnavailableError
+from market_data.periods import merge_a_share_60min_to_120min
 
 
 class SinaProvider:
@@ -138,20 +139,4 @@ class SinaProvider:
 
     @staticmethod
     def _merge_60min_to_120min(data):
-        if data is None or data.empty:
-            return data
-        result = data.copy().sort_values("trade_time")
-        result["trade_date"] = result["trade_time"].dt.date
-        result["group"] = result.groupby("trade_date").cumcount() // 2
-        return result.groupby(["trade_date", "group"], as_index=False).agg(
-            trade_time=("trade_time", "max"),
-            open=("open", "first"),
-            close=("close", "last"),
-            high=("high", "max"),
-            low=("low", "min"),
-            vol=("vol", "sum"),
-            amount=("amount", "sum"),
-            pre_close=("pre_close", "first"),
-            pct_chg=("pct_chg", "sum"),
-            is_st=("is_st", "max"),
-        ).drop(columns=["trade_date", "group"])
+        return merge_a_share_60min_to_120min(data)

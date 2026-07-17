@@ -1,7 +1,10 @@
 """多数据源降级、增量缓存和证券列表服务。"""
 
+import atexit
 import logging
 from datetime import datetime, time, timedelta, timezone
+from threading import RLock
+from typing import Callable, Optional, Sequence
 
 import pandas as pd
 
@@ -21,6 +24,7 @@ from market_data.config import (
 )
 from market_data.database import MarketDataDatabase
 from market_data.exceptions import MarketDataError, ProviderUnavailableError
+from market_data.interfaces import BarProvider, DateLike
 from market_data.providers import (
     BaoStockProvider,
     EastMoneyProvider,
@@ -40,14 +44,14 @@ class MarketDataService:
 
     def __init__(
         self,
-        database=None,
-        daily_providers=None,
-        minute_providers=None,
-        max_retries=PROVIDER_MAX_RETRIES,
-        minimum_stock_count=MIN_STOCK_LIST_SIZE,
-        minimum_etf_count=MIN_ETF_LIST_SIZE,
-        now_provider=None,
-    ):
+        database: Optional[MarketDataDatabase] = None,
+        daily_providers: Optional[Sequence[BarProvider]] = None,
+        minute_providers: Optional[Sequence[BarProvider]] = None,
+        max_retries: int = PROVIDER_MAX_RETRIES,
+        minimum_stock_count: int = MIN_STOCK_LIST_SIZE,
+        minimum_etf_count: int = MIN_ETF_LIST_SIZE,
+        now_provider: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         self.database = database or MarketDataDatabase(get_database_path(), get_database_journal_mode())
         self.max_retries = max(1, max_retries)
         self.minimum_stock_count = max(1, minimum_stock_count)
@@ -63,11 +67,9 @@ class MarketDataService:
         self.daily_providers = daily_providers if daily_providers is not None else [
             baostock_provider, yahoo_provider, sge_provider, sina_provider, tencent_provider, eastmoney_provider
         ]
-        self.minute_providers = minute_providers if minute_providers is not None else [
-            baostock_provider,
-            eastmoney_provider,
-            sina_provider,
-        ]
+        # BaoStock分钟线在交易时段内常停留于前一交易日，不参与实时策略链路。
+        # 新浪优先提供当日分钟线，东方财富负责兜底，二者失败后仍会回退到SQLite缓存。
+        self.minute_providers = minute_providers if minute_providers is not None else [sina_provider, eastmoney_provider]
         if daily_providers is None:
             from market_data.providers.tushare_provider import TushareProvider
 
@@ -160,7 +162,15 @@ class MarketDataService:
             "日线行情未包含目标交易日数据" in message or "返回空数据" in message
         )
 
-    def get_daily_data(self, symbol, start_date, end_date, force_refresh=False, minimum_trade_time=None, refresh_latest=False):
+    def get_daily_data(
+        self,
+        symbol: str,
+        start_date: DateLike,
+        end_date: DateLike,
+        force_refresh: bool = False,
+        minimum_trade_time: Optional[DateLike] = None,
+        refresh_latest: bool = False,
+    ) -> pd.DataFrame:
         return self.get_bars(symbol, "D", start_date, end_date, force_refresh, minimum_trade_time, refresh_latest)
 
     def daily_cache_ready(self, symbol, start_date, end_date):
@@ -426,10 +436,26 @@ class MarketDataService:
 
 
 _default_service = None
+_default_service_lock = RLock()
 
 
-def get_default_service():
+def get_default_service() -> MarketDataService:
+    """线程安全地创建CLI默认服务；Web和后台任务仍应显式管理实例。"""
     global _default_service
-    if _default_service is None:
-        _default_service = MarketDataService()
-    return _default_service
+    with _default_service_lock:
+        if _default_service is None:
+            _default_service = MarketDataService()
+        return _default_service
+
+
+def close_default_service() -> None:
+    """关闭并清空默认服务，避免后续调用复用已登出的Provider会话。"""
+    global _default_service
+    with _default_service_lock:
+        service = _default_service
+        _default_service = None
+    if service is not None:
+        service.close()
+
+
+atexit.register(close_default_service)

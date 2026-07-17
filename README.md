@@ -21,7 +21,7 @@ uv run a-stock-web
 
 ### 数据库目录与OneDrive同步
 
-“系统设置 → 行情数据库存储”可以修改 `market_data.db` 所在目录。目标目录尚无数据库时，
+“系统设置 → 数据库存储”可以修改 `market_data.db` 所在目录。目标目录尚无数据库时，
 可通过SQLite在线备份将当前历史K线、
 股票/ETF主数据、自定义分组和任务记录完整复制过去；目标已有同名数据库时不会覆盖，而是直接切换使用。
 每台设备的本机路径保存在
@@ -84,6 +84,9 @@ export MIN_ETF_LIST_SIZE=100
 export DAILY_CACHE_OVERLAP_BARS=2
 ```
 
+分钟K线保留时间统一在“系统设置 → 数据维护”中设置。历史日线不会自动删除；
+保存设置和Web服务启动时只清理超过保留天数的分钟K线，避免盘中监控缓存无限增长。
+
 东方财富默认只使用HTTPS。如所在网络只能访问其HTTP接口，可显式设置
 `ALLOW_INSECURE_HTTP_FALLBACK=1`，但不建议在不可信网络中开启。
 
@@ -91,7 +94,9 @@ export DAILY_CACHE_OVERLAP_BARS=2
 
 - `market_data/providers`：各数据源的协议适配与字段标准化。
 - `market_data/service.py`：数据源降级、有限重试、增量获取和缓存回退。
-- `market_data/database.py`：K线、股票/ETF主数据、自定义分组、交易日历和通知去重状态。
+- `market_data/database.py`：K线、股票/ETF主数据、自定义分组、交易日历和任务记录。
+- `market_data/interfaces.py`：行情Provider和日线读取服务的类型契约。
 - `stock_signal_monitor/stock_strategy.py`：只处理策略计算，不直接依赖某个行情SDK。
+- `web_app/index_service.py`：首页主要指数缓存、刷新冷却和历史分页。
 - `etf_monitor`：按K线收盘时间调度均线监控。
 - `web_app`：Flask API、后台任务入口和响应式Web控制台。

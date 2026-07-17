@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 import requests
 
-from common.StockEnum import StockStatus
+import market_data.service as service_module
 from market_data.database import MarketDataDatabase
 from market_data.providers.baostock_provider import BaoStockProvider
 from market_data.providers.eastmoney_provider import EastMoneyProvider
@@ -15,6 +15,7 @@ from market_data.service import MarketDataService
 from stock_signal_monitor.scan_market import retry_scan_errors
 from stock_signal_monitor.scan_market import scan_market
 from stock_signal_monitor.stock_strategy import daily_strategy_window
+from stock_signal_monitor.stock_status import StockStatus
 
 
 class FakeProvider:
@@ -262,7 +263,7 @@ class MarketDataServiceTest(unittest.TestCase):
 
         signal_dir = Path(self.temp_dir.name) / "signals"
         with patch("stock_signal_monitor.scan_market.RESOURCE_DIR", signal_dir), \
-                patch("stock_signal_monitor.scan_market.daily_check", return_value=[StockStatus.NO_MATCH]):
+                patch("stock_signal_monitor.scan_market.evaluate_daily_strategies", return_value=[StockStatus.NO_MATCH]):
             result = scan_market(service)
 
         self.assertEqual(4, result["processed_stocks"])
@@ -279,7 +280,7 @@ class MarketDataServiceTest(unittest.TestCase):
 
         signal_dir = Path(self.temp_dir.name) / "etf-signals"
         with patch("stock_signal_monitor.scan_market.RESOURCE_DIR", signal_dir), \
-                patch("stock_signal_monitor.scan_market.daily_check", return_value=[StockStatus.NO_MATCH]):
+                patch("stock_signal_monitor.scan_market.evaluate_daily_strategies", return_value=[StockStatus.NO_MATCH]):
             result = scan_market(service, asset_type="etf")
 
         self.assertEqual(2, result["processed_stocks"])
@@ -305,6 +306,67 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertTrue(next_bar)
+
+    def test_prune_minute_klines_keeps_daily_history(self):
+        daily = sample_bars()
+        minute = pd.DataFrame(
+            {
+                "trade_time": pd.date_range("2026-05-07 10:00", periods=70, freq="D"),
+                "close": [10.0] * 70,
+            }
+        )
+        self.database.save_klines("000001.SZ", "D", daily, "seed")
+        self.database.save_klines("000001.SZ", "15min", minute, "seed")
+
+        deleted = self.database.prune_minute_klines(2, now="2026-07-16")
+
+        self.assertEqual(8, deleted)
+        self.assertEqual(2, len(self.database.load_klines("000001.SZ", "D")))
+        self.assertEqual(62, len(self.database.load_klines("000001.SZ", "15min")))
+
+    def test_kline_moving_averages_survive_raw_market_data_upsert(self):
+        minute = pd.DataFrame(
+            {
+                "trade_time": pd.date_range("2026-07-01 09:45", periods=65, freq="15min"),
+                "close": [4.0 + index * 0.01 for index in range(65)],
+            }
+        )
+        prepared = minute.copy()
+        for window in (10, 30, 60):
+            prepared[f"MA{window}"] = prepared["close"].rolling(window).mean()
+        self.database.save_klines("510300.SH", "15min", minute, "sina")
+        self.database.save_kline_moving_averages("510300.SH", "15min", prepared)
+        self.database.save_klines("510300.SH", "15min", minute.tail(2), "eastmoney")
+
+        cached = self.database.load_klines("510300.SH", "15min")
+
+        self.assertEqual(65, len(cached))
+        self.assertAlmostEqual(float(prepared.iloc[-1]["MA60"]), float(cached.iloc[-1]["ma60"]))
+
+    def test_prune_removes_legacy_partial_120min_bars(self):
+        bars = pd.DataFrame(
+            {
+                "trade_time": pd.to_datetime(
+                    ["2026-07-17 10:30", "2026-07-17 11:30", "2026-07-17 14:00", "2026-07-17 15:00"]
+                ),
+                "close": [4.0, 4.1, 4.2, 4.3],
+            }
+        )
+        self.database.save_klines("510300.SH", "120min", bars, "legacy")
+
+        deleted = self.database.prune_minute_klines(365)
+        cached = self.database.load_klines("510300.SH", "120min")
+
+        self.assertEqual(2, deleted)
+        self.assertEqual(["11:30", "15:00"], cached["trade_time"].dt.strftime("%H:%M").tolist())
+
+    def test_close_default_service_clears_singleton_before_closing(self):
+        service = Mock()
+        with patch.object(service_module, "_default_service", service):
+            service_module.close_default_service()
+            self.assertIsNone(service_module._default_service)
+
+        service.close.assert_called_once_with()
 
     def test_compact_date_format_can_read_sqlite_cache(self):
         self.database.save_klines("000001.SZ", "D", sample_bars(), "seed")
@@ -398,6 +460,50 @@ class MarketDataServiceTest(unittest.TestCase):
 
         self.assertEqual({"data": {"klines": []}}, payload)
         direct_get.assert_called_once()
+
+    def test_eastmoney_uses_unadjusted_minutes_and_forward_adjusted_daily_data(self):
+        provider = EastMoneyProvider()
+        payload = {"data": {"klines": []}}
+        try:
+            with patch.object(provider, "_get_json", return_value=payload) as request:
+                provider._request_klines("510300", "1", "15min", "20260701", "20260717")
+                minute_params = request.call_args.args[1]
+                provider._request_klines("510300", "1", "D", "20260701", "20260717")
+                daily_params = request.call_args.args[1]
+        finally:
+            provider.close()
+
+        self.assertEqual("0", minute_params["fqt"])
+        self.assertEqual("1", daily_params["fqt"])
+
+    def test_default_realtime_sources_exclude_baostock(self):
+        service = MarketDataService(self.database)
+        try:
+            self.assertEqual(["sina", "eastmoney"], [provider.name for provider in service.minute_providers])
+            self.assertIn("baostock", [provider.name for provider in service.daily_providers])
+        finally:
+            service.close()
+
+    def test_realtime_monitor_state_and_cross_event_are_persisted(self):
+        self.database.replace_etf_list(sample_etf_list(), "seed")
+        monitor = self.database.add_realtime_monitor("510300.SH", "etf")
+        snapshot = {
+            "bar_time": "2026-07-17 10:45:00",
+            "close": 4.25,
+            "ma_values": {10: 4.20, 30: 4.10, 60: 4.00},
+            "crosses": {10: "up", 30: None, 60: None},
+            "above_all": True,
+        }
+
+        self.database.save_realtime_signal_state(monitor, "15min", snapshot, "sina")
+        self.database.save_realtime_signal_state(monitor, "15min", snapshot, "sina")
+
+        state = self.database.get_realtime_signal_states(["510300.SH"])[0]
+        events = self.database.get_realtime_signal_events("510300.SH")
+        self.assertEqual(1, state["above_all"])
+        self.assertEqual("up", state["cross_ma10"])
+        self.assertEqual("sina", state["source"])
+        self.assertEqual(1, len(events))
 
     def test_stock_and_etf_groups_are_independent_and_support_pinning(self):
         self.database.replace_stock_list(sample_stock_list(), "seed")
@@ -505,14 +611,16 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual("多行情源连接故障", items[0]["error_category"])
         self.assertIn("BaoStock 会话失效", items[0]["error_summary"])
 
-    @patch("stock_signal_monitor.scan_market.daily_check", return_value=[StockStatus.NO_MATCH])
-    def test_retry_scan_errors_resolves_successful_stock(self, _daily_check):
+    @patch("stock_signal_monitor.scan_market.evaluate_daily_strategies", return_value=[StockStatus.NO_MATCH])
+    def test_retry_scan_errors_resolves_successful_stock(self, _evaluate_daily_strategies):
         run_id = self.database.start_scan_run(1)
         self.database.save_scan_error(run_id, "000001.SZ", "平安银行", "TimeoutError", "请求超时")
         self.database.finish_scan_run(run_id, "completed", 1, 0, 1)
         service = MarketDataService(self.database, [], [], max_retries=1)
 
-        result = retry_scan_errors(run_id, service)
+        bars = MarketDataService._prepare_result(sample_bars())
+        with patch.object(service, "get_daily_data", return_value=bars):
+            result = retry_scan_errors(run_id, service)
         summary = self.database.get_scan_error_summary(run_id)
         task_run = self.database.get_task_history(1)[0]
 

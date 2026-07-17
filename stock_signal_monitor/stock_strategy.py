@@ -1,95 +1,53 @@
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from math import ceil
 
 import pandas as pd
 
-from common.StockEnum import StockStatus
 from market_data.service import get_default_service
+from stock_signal_monitor.stock_status import StockStatus
 
 
-def daily_check(ts_code, stock_name, service=None):
-    # 排除ST股票
-    if 'ST' in stock_name:
-        return [StockStatus.NO_MATCH]
+logger = logging.getLogger(__name__)
 
-    # 延续原策略范围：排除北交所与科创板，北交所代码可能以4或8开头。
-    if ts_code.startswith(('4', '8', '92', '688')):
-        return [StockStatus.NO_MATCH]
 
+def daily_check(ts_code: str, stock_name: str, service=None) -> list[StockStatus]:
+    """兼容单标的调用入口；数据获取完成后交给纯策略函数计算。"""
     start_date, end_date = daily_strategy_window()
-
-    # 通过统一服务按免费网络源、可选付费兜底、SQLite缓存的顺序自动降级。
     market_data_service = service or get_default_service()
     daily_data = market_data_service.get_daily_data(ts_code, start_date, end_date)
+    return evaluate_daily_strategies(daily_data, ts_code, stock_name)
 
-    # 检查数据是否足够（至少有7天数据）
-    if len(daily_data) >= 7:
-        # 排序为正序，最新的在最后
-        daily_data = daily_data.sort_values(by='trade_date', ascending=True)
-        # 重置索引，但保持排序
-        daily_data = daily_data.reset_index(drop=True)
 
-        result = []  # 初始化一个结果列表
-
-        # 检查是否连续3天涨停 done
-        if is_limit_up_3days(daily_data, ts_code):
-            result.append(StockStatus.THREE_LIMIT_UP)
-
-        # 检查是否只有3天涨停 done
-        if is_limit_up_only_3days(daily_data, ts_code):
-            result.append(StockStatus.THREE_LIMIT_UP_ONLY)
-
-        # 检查连续3天上涨且成交量逐步放大 done
-        if is_rising_with_volume_increase(daily_data, days=3):
-            result.append(StockStatus.RISING_VOLUME_INCREASE)
-
-        # 检查大幅放量伴随上涨 done
-        if is_volume_surge_with_price_rise(daily_data, days=3):
-            result.append(StockStatus.VOLUME_SURGE_WITH_PRICE_RISE)
-
-        # 检查资金是否明显流入 done
-        if is_capital_inflow(daily_data):
-            result.append(StockStatus.CAPITAL_INFLOW)
-
-        # 检查是否出现企稳迹象 5日穿10日 done
-        if is_stock_stabilizing(daily_data, days=3):
-            result.append(StockStatus.SUPPORT_LEVEL_REBOUND)
-
-        # 检查是否出现企稳迹象 穿60日线 done
-        if is_stock_stabilizing_over60(daily_data):
-            result.append(StockStatus.SUPPORT_LEVEL_REBOUND_60)
-
-        # 检查最近3天是否出现MACD金叉 done
-        if is_macd_golden_cross(daily_data):
-            result.append(StockStatus.MACD_GOLDEN_CROSS)
-
-        # 检查最近7天是否出现MACD金叉 done
-        if is_macd_golden_cross_7(daily_data):
-            result.append(StockStatus.MACD_GOLDEN_CROSS_OVER_7)
-
-        # 双底结构 done
-        if is_double_bottom(daily_data):
-            result.append(StockStatus.DOUBLE_BOTTOM)
-
-        # 双底结构new
-        if is_double_bottom_new(daily_data):
-            result.append(StockStatus.DOUBLE_BOTTOM_NEW)
-
-        # 横盘期后出现放量上涨。
-        if is_breakout_after_consolidation(daily_data):
-            result.append(StockStatus.BREAKOUT_AFTER_CONSOLIDATION)
-
-        # 是否处于上涨初期
-        if is_upward_trend(daily_data):
-            result.append(StockStatus.IS_UPWARD_TREND)
-
-        if is_funds_inflow_by_volume_turnover(daily_data):
-            result.append(StockStatus.FUNDS_INFLOW_BY_VOLUME_TURNOVER)
-
-        return result if result else [StockStatus.NO_MATCH]
-
-    return [StockStatus.NO_MATCH]
+def evaluate_daily_strategies(daily_data: pd.DataFrame, ts_code: str, stock_name: str) -> list[StockStatus]:
+    """只基于传入日线计算策略，不访问网络、数据库或全局服务。"""
+    if "ST" in stock_name:
+        return [StockStatus.NO_MATCH]
+    if ts_code.startswith(("4", "8", "92", "688")):
+        return [StockStatus.NO_MATCH]
+    if daily_data is None or len(daily_data) < 7:
+        return [StockStatus.NO_MATCH]
+    sort_column = "trade_date" if "trade_date" in daily_data.columns else "trade_time"
+    prepared_data = daily_data.sort_values(by=sort_column, ascending=True).reset_index(drop=True).copy()
+    checks = (
+        (StockStatus.THREE_LIMIT_UP, lambda: is_limit_up_3days(prepared_data, ts_code)),
+        (StockStatus.THREE_LIMIT_UP_ONLY, lambda: is_limit_up_only_3days(prepared_data, ts_code)),
+        (StockStatus.RISING_VOLUME_INCREASE, lambda: is_rising_with_volume_increase(prepared_data, days=3)),
+        (StockStatus.VOLUME_SURGE_WITH_PRICE_RISE, lambda: is_volume_surge_with_price_rise(prepared_data, days=3)),
+        (StockStatus.CAPITAL_INFLOW, lambda: is_capital_inflow(prepared_data)),
+        (StockStatus.SUPPORT_LEVEL_REBOUND, lambda: is_stock_stabilizing(prepared_data, days=3)),
+        (StockStatus.SUPPORT_LEVEL_REBOUND_60, lambda: is_stock_stabilizing_over60(prepared_data)),
+        (StockStatus.MACD_GOLDEN_CROSS, lambda: is_macd_golden_cross(prepared_data)),
+        (StockStatus.MACD_GOLDEN_CROSS_OVER_7, lambda: is_macd_golden_cross_7(prepared_data)),
+        (StockStatus.DOUBLE_BOTTOM, lambda: is_double_bottom(prepared_data)),
+        (StockStatus.DOUBLE_BOTTOM_NEW, lambda: is_double_bottom_new(prepared_data)),
+        (StockStatus.BREAKOUT_AFTER_CONSOLIDATION, lambda: is_breakout_after_consolidation(prepared_data)),
+        (StockStatus.IS_UPWARD_TREND, lambda: is_upward_trend(prepared_data)),
+        (StockStatus.FUNDS_INFLOW_BY_VOLUME_TURNOVER, lambda: is_funds_inflow_by_volume_turnover(prepared_data)),
+    )
+    results = [status for status, check in checks if check()]
+    return results or [StockStatus.NO_MATCH]
 
 
 def daily_strategy_window(today=None):
@@ -647,7 +605,7 @@ def is_funds_inflow_by_volume_turnover(daily_data, n=7, m=30, ratio=1.2, pct_pos
     # 检查数据中是否包含换手率字段
     turnover_field = 'turnover_rate' if 'turnover_rate' in daily_data.columns else 'tor'
     if turnover_field not in daily_data.columns:
-        print(f"数据中缺少换手率字段: {daily_data.columns}")
+        logger.debug("日线数据缺少换手率字段: %s", list(daily_data.columns))
         return False
 
     vol_recent = daily_data['vol'].iloc[-n:].mean()
@@ -665,10 +623,4 @@ def is_funds_inflow_by_volume_turnover(daily_data, n=7, m=30, ratio=1.2, pct_pos
 
 
 if __name__ == "__main__":
-    # 示例股票代码和名称
-    ts_code = '000001.SZ'
-    stock_name = '平安银行'
-    # 调用检查函数
-    results = daily_check(ts_code, stock_name)
-    # 打印结果
-    print(f"检查结果: {results}")
+    logger.info("检查结果: %s", daily_check("000001.SZ", "平安银行"))
