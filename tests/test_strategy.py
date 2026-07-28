@@ -93,22 +93,58 @@ class StrategyTest(unittest.TestCase):
         self.assertFalse(is_consecutive_rise_with_amount_expansion(amount))
 
     def test_breakout_after_consolidation_requires_price_and_volume_expansion(self):
-        data = pd.DataFrame({"close": [10] * 30 + [10, 10.1, 10.2, 10.3, 10.5], "vol": [100] * 30 + [130] * 5})
+        data = pd.DataFrame(
+            {
+                "close": [10.0] * 20 + [10.0, 10.25, 10.30],
+                "high": [10.05] * 20 + [10.05, 10.28, 10.35],
+                "vol": [100.0] * 20 + [100.0, 160.0, 120.0],
+            }
+        )
 
         self.assertTrue(is_breakout_after_consolidation(data))
-        data.loc[30:, "vol"] = 105
+        data.loc[21, "vol"] = 140
         self.assertFalse(is_breakout_after_consolidation(data))
 
     def test_breakout_after_consolidation_rejects_rising_price_below_resistance(self):
-        consolidation = [10.0 + (index % 5) * 0.1 for index in range(30)]
         data = pd.DataFrame(
             {
-                "close": consolidation + [10.00, 10.05, 10.10, 10.15, 10.20],
-                "vol": [100.0] * 30 + [130.0] * 5,
+                "close": [10.0] * 20 + [10.0, 10.10, 10.15],
+                "high": [10.20] * 20 + [10.10, 10.15, 10.20],
+                "vol": [100.0] * 20 + [100.0, 180.0, 180.0],
             }
         )
 
         self.assertFalse(is_breakout_after_consolidation(data))
+
+    def test_breakout_after_consolidation_ignores_one_abnormal_upper_shadow(self):
+        data = pd.DataFrame(
+            {
+                "close": [10.0] * 20 + [10.0, 10.25, 10.30],
+                "high": [12.0] + [10.05] * 19 + [10.05, 10.28, 10.35],
+                "vol": [100.0] * 20 + [100.0, 160.0, 120.0],
+            }
+        )
+
+        self.assertTrue(is_breakout_after_consolidation(data))
+
+    def test_breakout_after_consolidation_rejects_weak_or_overextended_breakout(self):
+        weak_breakout = pd.DataFrame(
+            {
+                "close": [10.0] * 20 + [10.0, 10.12, 10.15],
+                "high": [10.05] * 20 + [10.05, 10.15, 10.18],
+                "vol": [100.0] * 20 + [100.0, 180.0, 120.0],
+            }
+        )
+        overextended = pd.DataFrame(
+            {
+                "close": [10.0] * 20 + [10.0, 10.25, 11.30],
+                "high": [10.05] * 20 + [10.05, 10.28, 11.35],
+                "vol": [100.0] * 20 + [100.0, 180.0, 120.0],
+            }
+        )
+
+        self.assertFalse(is_breakout_after_consolidation(weak_breakout))
+        self.assertFalse(is_breakout_after_consolidation(overextended))
 
     def test_volume_turnover_inflow_requires_both_metrics_to_expand(self):
         data = pd.DataFrame(

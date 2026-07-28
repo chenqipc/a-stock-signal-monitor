@@ -1,13 +1,15 @@
 """Flask Web入口和JSON接口。"""
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 from flask import Flask, jsonify, render_template, request
 
+from etf_monitor.ma_monitor import calculate_moving_averages
 from etf_monitor.realtime_monitor import MONITOR_PERIODS, RealtimeMonitorManager
+from market_data.adjustment import repair_cached_daily_prices, repair_cached_minute_prices
 from market_data.config import (
     DATABASE_FILENAME,
     get_data_maintenance_configuration,
@@ -27,6 +29,8 @@ from .tasks import TaskManager
 
 
 INDICATOR_TONES = ("emerald", "cyan", "amber", "violet", "rose", "blue")
+DAILY_MA_WINDOWS = (10, 30, 60)
+DAILY_MA_WARMUP_MONTHS = 4
 
 
 def create_app(config=None, database=None, task_manager=None, realtime_monitor=None):
@@ -168,7 +172,15 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
             monitor = _database(app).add_realtime_monitor(body.get("symbol"), asset_type)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"monitor": monitor, "realtime": _realtime_monitor_payload(app)}), 201
+        # 首次加入时即补齐分钟K线；实时监控未启动时由一次性后台队列串行执行。
+        initialization_queued = _realtime_monitor(app).request_initialization(monitor["symbol"])
+        return jsonify(
+            {
+                "monitor": monitor,
+                "initialization_queued": initialization_queued,
+                "realtime": _realtime_monitor_payload(app),
+            }
+        ), 201
 
     @app.delete("/api/realtime-monitor/watchlist/<path:symbol>")
     def remove_realtime_monitor(symbol):
@@ -309,30 +321,84 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
             return jsonify({"error": "before 必须是有效日期"}), 400
         end_date = (before_date - pd.DateOffset(days=1)).date() if before_date is not None else datetime.now().date()
         start_date = (pd.Timestamp(end_date) - pd.DateOffset(months=months)).date()
+        calculation_start_date = (pd.Timestamp(start_date) - pd.DateOffset(months=DAILY_MA_WARMUP_MONTHS)).date()
         database = _database(app)
         data = database.load_klines(normalized_symbol, period, start_date, end_date) if period == "D" else database.load_klines(normalized_symbol, period)
+        calculation_data = database.load_klines(normalized_symbol, period, calculation_start_date, end_date) if period == "D" else data
         source = "sqlite_cache" if not data.empty else "unavailable"
         warning = None
+        minute_cache_rebuilt = False
         if ensure_data:
             service = MarketDataService(database=database)
             try:
-                # 统一服务会先校验SQLite覆盖范围；仅缺少最新日线或成交量时访问网络并写回SQLite。
+                # 比可见区间额外补四个月日线作为MA60预热数据，统一服务会自动写回SQLite。
                 missing_chart_fields = not data.empty and not MarketDataService._daily_data_has_chart_fields(data)
-                data = service.get_daily_data(normalized_symbol, start_date, end_date, force_refresh=missing_chart_fields)
-                source = data.attrs.get("source", source)
-                provider_errors = data.attrs.get("provider_errors") or []
+                calculation_data = service.get_daily_data(
+                    normalized_symbol,
+                    calculation_start_date,
+                    end_date,
+                    force_refresh=missing_chart_fields,
+                )
+                source = calculation_data.attrs.get("source", source)
+                provider_errors = calculation_data.attrs.get("provider_errors") or []
                 warning = "; ".join(provider_errors) if provider_errors else None
             except Exception as exc:
                 warning = str(exc)
-                data = database.load_klines(normalized_symbol, period, start_date, end_date)
-                source = "sqlite_stale_cache" if not data.empty else "unavailable"
+                calculation_data = database.load_klines(normalized_symbol, period, calculation_start_date, end_date)
+                source = "sqlite_stale_cache" if not calculation_data.empty else "unavailable"
             finally:
                 service.close()
+        if period != "D" and not data.empty:
+            data, minute_adjustment_events = repair_cached_minute_prices(database, normalized_symbol, period)
+            suspicious_ma_cache = _minute_ma_cache_is_suspicious(data)
+            if suspicious_ma_cache:
+                service = MarketDataService(database=database)
+                try:
+                    refresh_start = (datetime.now() - timedelta(days=180)).date()
+                    refreshed = service.get_minute_data(
+                        normalized_symbol,
+                        period,
+                        refresh_start,
+                        datetime.now().date(),
+                        force_refresh=True,
+                    )
+                    data = refreshed
+                    source = refreshed.attrs.get("source", source)
+                    provider_errors = refreshed.attrs.get("provider_errors") or []
+                    warning = "; ".join(provider_errors) if provider_errors else warning
+                except Exception as exc:
+                    warning = f"分钟历史补取失败，已使用现有缓存重算均线：{exc}"
+                finally:
+                    service.close()
+            if minute_adjustment_events or suspicious_ma_cache:
+                # 价格口径变化或旧均线尺度异常时，所有均线必须在同一批连续价格上重新计算。
+                prepared_minute = calculate_moving_averages(data)
+                database.save_kline_moving_averages(normalized_symbol, period, prepared_minute)
+                maintenance = get_data_maintenance_configuration(app.extensions["database_settings_path"])
+                database.prune_minute_klines(maintenance["minute_kline_retention_days"])
+                data = database.load_klines(normalized_symbol, period)
+                minute_cache_rebuilt = True
+            adjustment_events = minute_adjustment_events
+        elif period == "D" and not calculation_data.empty:
+            repaired_history, adjustment_events = repair_cached_daily_prices(database, normalized_symbol)
+            if not repaired_history.empty:
+                calculation_data = repaired_history[
+                    (repaired_history["trade_time"] >= pd.Timestamp(calculation_start_date))
+                    & (repaired_history["trade_time"] <= pd.Timestamp(end_date))
+                ].copy()
+            calculation_data = _persist_daily_moving_averages(database, normalized_symbol, calculation_data)
+            data = calculation_data[
+                (calculation_data["trade_time"] >= pd.Timestamp(start_date))
+                & (calculation_data["trade_time"] <= pd.Timestamp(end_date))
+            ].copy()
+        else:
+            adjustment_events = []
         if before_date is not None and not data.empty:
             data = data[data["trade_time"] < before_date]
         # 网络补历史时只要本页有数据就允许继续向前探测，上市首日前的空页会自然终止加载。
         has_more = period == "D" and (len(data) >= limit or (ensure_data and not data.empty))
         data = data.tail(limit)
+        ma_metadata = _daily_ma_metadata(database, normalized_symbol, data, calculation_data) if period == "D" else {}
         return jsonify(
             {
                 "symbol": normalized_symbol,
@@ -342,6 +408,9 @@ def create_app(config=None, database=None, task_manager=None, realtime_monitor=N
                 "has_more": has_more,
                 "has_volume": MarketDataService._daily_data_has_volume(data),
                 "has_ohlcv": MarketDataService._daily_data_has_chart_fields(data),
+                "price_adjusted": bool(adjustment_events),
+                "minute_cache_rebuilt": minute_cache_rebuilt,
+                **ma_metadata,
                 "items": _frame_records(data),
             }
         )
@@ -610,6 +679,61 @@ def _positive_int(value, default):
         return max(1, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _persist_daily_moving_averages(database, symbol, data):
+    """使用额外历史窗口计算日线MA，并同时回写SQLite供后续图表直接复用。"""
+    calculated = data.sort_values("trade_time").drop_duplicates("trade_time", keep="last").reset_index(drop=True).copy()
+    close = pd.to_numeric(calculated["close"], errors="coerce")
+    for window in DAILY_MA_WINDOWS:
+        values = close.rolling(window).mean()
+        calculated[f"ma{window}"] = values
+        calculated[f"MA{window}"] = values
+    # 只持久化三条均线均有定义的日期，避免有限预热窗口把数据库中更早的有效MA覆盖为空值。
+    persistable = calculated.dropna(subset=[f"MA{window}" for window in DAILY_MA_WINDOWS])
+    database.save_kline_moving_averages(symbol, "D", persistable)
+    return calculated
+
+
+def _minute_ma_cache_is_suspicious(data):
+    """识别与当前分钟价格相差过大的持久化均线，典型原因是ETF拆分后仍混用旧价格口径。"""
+    if data is None or data.empty or "close" not in data.columns:
+        return False
+    close = pd.to_numeric(data["close"], errors="coerce").dropna()
+    median_close = close.median() if not close.empty else None
+    if median_close is None or pd.isna(median_close) or median_close <= 0:
+        return False
+    for column in ("ma10", "ma30", "ma60"):
+        if column not in data.columns:
+            continue
+        moving_average = pd.to_numeric(data[column], errors="coerce").dropna()
+        if moving_average.empty:
+            continue
+        ratios = moving_average / median_close
+        if (ratios < 0.5).any() or (ratios > 1.5).any():
+            return True
+    return False
+
+
+def _daily_ma_metadata(database, symbol, data, history_data):
+    """说明返回区间的均线是否从首根K线起完整，区分缓存缺失和可用历史不足。"""
+    if data is None or data.empty:
+        return {"ma_ready": False, "ma_complete_from": None, "ma_warning": None}
+    first = data.iloc[0]
+    missing_windows = [window for window in DAILY_MA_WINDOWS if pd.isna(first.get(f"ma{window}"))]
+    available_history = history_data if history_data is not None and not history_data.empty else data
+    complete_rows = available_history.dropna(subset=[f"ma{window}" for window in DAILY_MA_WINDOWS])
+    complete_from = None if complete_rows.empty else pd.Timestamp(complete_rows.iloc[0]["trade_time"]).strftime("%Y-%m-%d")
+    if not missing_windows:
+        return {"ma_ready": True, "ma_complete_from": complete_from, "ma_warning": None}
+    history_start = pd.Timestamp(available_history.iloc[0]["trade_time"]).strftime("%Y-%m-%d")
+    maximum_window = max(missing_windows)
+    fetch_state = database.get_fetch_state(symbol, "D") or {}
+    coverage_start = fetch_state.get("coverage_start")
+    coverage_text = pd.Timestamp(coverage_start).strftime("%Y-%m-%d") if coverage_start else None
+    checked_text = f"，行情源已向前补查至{coverage_text}" if coverage_text else ""
+    warning = f"当前可用日线始于{history_start}{checked_text}；MA{maximum_window}需要至少{maximum_window}根历史K线，早期线段暂无定义。"
+    return {"ma_ready": False, "ma_complete_from": complete_from, "ma_warning": warning}
 
 
 def _frame_records(data):

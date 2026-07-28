@@ -14,7 +14,7 @@ class StockStatus(Enum):
     SUPPORT_LEVEL_REBOUND_60 = "放量突破60日均线"
     MACD_GOLDEN_CROSS = "MACD金叉（近3日）"
     DOUBLE_BOTTOM = "双底突破确认"
-    BREAKOUT_AFTER_CONSOLIDATION = "横盘后放量上涨"
+    BREAKOUT_AFTER_CONSOLIDATION = "横盘放量突破"
     IS_UPWARD_TREND = "上涨初期评分"
 
 

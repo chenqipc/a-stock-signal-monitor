@@ -355,51 +355,60 @@ def is_double_bottom(
 
 def is_breakout_after_consolidation(
     daily_data,
-    consolidation_days=30,
-    recent_days=5,
-    price_threshold=0.05,
-    volume_increase_threshold=1.2,
+    consolidation_days=20,
+    recent_days=3,
+    price_range_limit=0.08,
+    resistance_quantile=0.90,
+    volume_ratio=1.5,
     breakout_buffer=0.005,
+    minimum_breakout_gain=0.015,
+    maximum_extension=0.12,
 ):
-    """确认最近窗口内放量上穿横盘上沿，且最新收盘仍处于上沿之上。"""
-    required_columns = {"close", "vol"}
+    """确认近期放量突破横盘压力位，并过滤弱突破、假突破和已经过度上涨的标的。"""
+    required_columns = {"close", "high", "vol"}
     if not required_columns.issubset(daily_data.columns) or len(daily_data) < consolidation_days + recent_days:
         return False
 
     consolidation_data = daily_data.iloc[-(consolidation_days + recent_days):-recent_days].copy()
     recent_data = daily_data.iloc[-recent_days:].copy()
     consolidation_close = pd.to_numeric(consolidation_data["close"], errors="coerce")
+    consolidation_high = pd.to_numeric(consolidation_data["high"], errors="coerce")
+    consolidation_volume = pd.to_numeric(consolidation_data["vol"], errors="coerce")
     recent_close = pd.to_numeric(recent_data["close"], errors="coerce")
     recent_volume = pd.to_numeric(recent_data["vol"], errors="coerce")
-    if consolidation_close.isna().any() or recent_close.isna().any() or recent_volume.isna().any():
+    numeric_series = (consolidation_close, consolidation_high, consolidation_volume, recent_close, recent_volume)
+    if any(values.isna().any() for values in numeric_series):
         return False
 
-    # 收盘价用于判断横盘稳定性；若有最高价字段，则用区间最高价作为更严格的突破上沿。
-    max_price = consolidation_close.max()
-    min_price = consolidation_close.min()
-    if min_price <= 0:
+    median_close = consolidation_close.median()
+    if median_close <= 0:
         return False
-    price_range = (max_price - min_price) / min_price
-    if price_range > price_threshold:
+    price_range = (consolidation_close.max() - consolidation_close.min()) / median_close
+    if price_range > price_range_limit:
         return False
-    if "high" in consolidation_data.columns:
-        resistance = pd.to_numeric(consolidation_data["high"], errors="coerce").max()
-    else:
-        resistance = max_price
-    average_volume = pd.to_numeric(consolidation_data["vol"], errors="coerce").mean()
-    if pd.isna(resistance) or pd.isna(average_volume) or average_volume <= 0:
+
+    # 最高价90分位比单日最高价更能代表反复承压的位置，可避免异常上影线令压力位失真。
+    resistance = consolidation_high.quantile(resistance_quantile)
+    reference_volume = consolidation_volume.median()
+    if pd.isna(resistance) or resistance <= 0 or pd.isna(reference_volume) or reference_volume <= 0:
         return False
 
     breakout_level = resistance * (1.0 + breakout_buffer)
     previous_close = consolidation_close.iloc[-1]
     breakout_confirmed = False
     for current_close, current_volume in zip(recent_close, recent_volume):
+        daily_gain = current_close / previous_close - 1.0 if previous_close > 0 else float("-inf")
         crossed_resistance = previous_close <= breakout_level < current_close
-        if crossed_resistance and current_volume >= average_volume * volume_increase_threshold:
+        volume_expanded = current_volume >= reference_volume * volume_ratio
+        if crossed_resistance and volume_expanded and daily_gain >= minimum_breakout_gain:
             breakout_confirmed = True
         previous_close = current_close
-    # 突破后跌回横盘上沿下方属于失败突破，不继续保留信号。
-    return breakout_confirmed and recent_close.iloc[-1] > resistance
+
+    # 突破后跌回压力位下方视为失败；距离压力位超过12%则信号已经不属于突破初期。
+    latest_close = recent_close.iloc[-1]
+    breakout_held = latest_close > resistance
+    not_overextended = latest_close <= resistance * (1.0 + maximum_extension)
+    return bool(breakout_confirmed and breakout_held and not_overextended)
 
 
 def calculate_upward_trend_score(daily_data):

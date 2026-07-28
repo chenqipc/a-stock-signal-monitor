@@ -209,6 +209,16 @@ class MarketDataServiceTest(unittest.TestCase):
         self.assertEqual(pd.Timestamp("2026-07-10"), provider.requests[0][2])
         self.assertEqual(pd.Timestamp("2026-07-15"), provider.requests[0][3])
 
+    def test_forced_minute_refresh_fetches_full_requested_window(self):
+        self.database.save_klines("000001.SZ", "15min", sample_bars(), "seed")
+        provider = FakeProvider("network", sample_bars())
+        service = MarketDataService(self.database, [provider], [provider], max_retries=1)
+
+        service.get_minute_data("000001.SZ", "15min", "2026-07-01", "2026-07-13", force_refresh=True)
+
+        self.assertEqual(1, provider.calls)
+        self.assertEqual(pd.Timestamp("2026-07-01"), provider.requests[0][2])
+
     def test_intraday_daily_refresh_requires_and_persists_current_bar(self):
         self.database.save_klines(
             "000001.SH", "D", sample_bars(), "seed", coverage_start="2026-07-01", coverage_end="2026-07-13"

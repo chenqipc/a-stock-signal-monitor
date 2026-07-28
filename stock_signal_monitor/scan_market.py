@@ -10,6 +10,7 @@ from typing import Optional, TextIO
 import pandas as pd
 
 from infrastructure.logging import configure_application_logging
+from market_data.adjustment import repair_cached_daily_prices
 from market_data.config import RESOURCE_DIR, SCAN_CACHED_WORKERS
 from market_data.service import MarketDataService
 
@@ -191,7 +192,9 @@ def wait_for_next_result(pending):
 
 def scan_cached_row(row: dict, database, start_date, end_date) -> dict:
     ts_code = row["ts_code"]
-    data = database.load_klines(ts_code, "D", start_date, end_date)
+    repair_start = (pd.Timestamp(start_date) - pd.DateOffset(months=4)).date()
+    repaired_data, _ = repair_cached_daily_prices(database, ts_code, repair_start, end_date)
+    data = repaired_data[repaired_data["trade_time"] >= pd.Timestamp(start_date)].copy()
     prepared_data = MarketDataService._prepare_result(data)
     return evaluate_stock_row(row, prepared_data)
 
@@ -298,7 +301,10 @@ def retry_scan_errors(run_id, service=None, control=None):
             asset_type = item.get("asset_type", "stock")
             try:
                 start_date, end_date = daily_strategy_window()
-                daily_data = market_data_service.get_daily_data(ts_code, start_date, end_date)
+                market_data_service.get_daily_data(ts_code, start_date, end_date)
+                repair_start = (pd.Timestamp(start_date) - pd.DateOffset(months=4)).date()
+                repaired_data, _ = repair_cached_daily_prices(database, ts_code, repair_start, end_date)
+                daily_data = repaired_data[repaired_data["trade_time"] >= pd.Timestamp(start_date)].copy()
                 results = evaluate_daily_strategies(daily_data, ts_code, stock_name)
                 signal_types = [status.value for status in results if status != StockStatus.NO_MATCH]
                 signal_details = build_daily_signal_details(daily_data, results)

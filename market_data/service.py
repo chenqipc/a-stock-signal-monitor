@@ -8,6 +8,7 @@ from typing import Callable, Optional, Sequence
 
 import pandas as pd
 
+from market_data.adjustment import repair_cached_minute_prices
 from market_data.config import (
     DAILY_CACHE_OVERLAP_BARS,
     ENABLE_TUSHARE_FALLBACK,
@@ -98,6 +99,8 @@ class MarketDataService:
             cache_ready = cache_ready and self._cache_covers_range(cached, start_date, end_date, period)
             cache_ready = cache_ready and self._meets_minimum_trade_time(cached, minimum_trade_time)
         if not force_refresh and not refresh_latest and not cached.empty and cache_ready:
+            if period != "D":
+                cached, _ = repair_cached_minute_prices(self.database, normalized_symbol, period, start_date, end_date)
             result = self._prepare_result(cached)
             result.attrs["source"] = "sqlite_cache"
             result.attrs["cached_sources"] = sorted(cached["source"].dropna().unique().tolist())
@@ -107,7 +110,7 @@ class MarketDataService:
             fetch_start = start_date if force_refresh or not daily_start_covered else self._daily_incremental_start(cached, start_date)
             fetch_end = daily_target
         else:
-            fetch_start = self._incremental_start(cached, start_date, period)
+            fetch_start = start_date if force_refresh else self._incremental_start(cached, start_date, period)
             fetch_end = end_date
         providers = self.daily_providers if period == "D" else self.minute_providers
         errors = []
@@ -139,7 +142,10 @@ class MarketDataService:
                     coverage_start=actual_fetch_start,
                     coverage_end=fetch_end,
                 )
-                merged = self.database.load_klines(normalized_symbol, period, start_date, end_date)
+                if period == "D":
+                    merged = self.database.load_klines(normalized_symbol, period, start_date, end_date)
+                else:
+                    merged, _ = repair_cached_minute_prices(self.database, normalized_symbol, period, start_date, end_date)
                 result = self._prepare_result(merged)
                 result.attrs["source"] = provider.name
                 return result

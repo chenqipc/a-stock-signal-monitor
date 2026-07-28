@@ -520,15 +520,19 @@ async function loadRealtimeMonitor(silent = false) {
 function renderRealtimeMonitor(data) {
     const manager = data.manager || {};
     const running = ["running", "stopping"].includes(manager.status);
+    const initializingCount = manager.initializing_symbols?.length || 0;
     const stateElement = document.getElementById("realtimeMonitorState");
-    stateElement.textContent = manager.status === "running" ? "监控运行中" : manager.status === "stopping" ? "正在停止" : "未启动";
-    stateElement.classList.toggle("active", manager.status === "running");
+    stateElement.textContent = manager.status === "running"
+        ? "监控运行中"
+        : manager.status === "stopping" ? "正在停止" : initializingCount ? "正在初始化K线" : "未启动";
+    stateElement.classList.toggle("active", manager.status === "running" || initializingCount > 0);
     stateElement.classList.toggle("stopping", manager.status === "stopping");
     document.getElementById("startRealtimeMonitor").disabled = running;
     document.getElementById("stopRealtimeMonitor").disabled = !running;
     const scanTime = manager.last_scan_at ? `最近扫描 ${formatDate(manager.last_scan_at)}` : "尚未执行扫描";
     const currentPeriod = manager.current_period ? ` · 正在处理 ${manager.current_period}` : "";
-    document.getElementById("realtimeMonitorMeta").textContent = `${scanTime}${currentPeriod}`;
+    const initializing = initializingCount ? ` · 正在补取 ${initializingCount} 只ETF缺失的分钟K线` : "";
+    document.getElementById("realtimeMonitorMeta").textContent = `${scanTime}${currentPeriod}${initializing}`;
     document.getElementById("realtimeIntervals").innerHTML = (data.periods || []).map((period) => {
         const interval = manager.intervals?.[period];
         const nextRun = manager.next_runs?.[period];
@@ -537,7 +541,7 @@ function renderRealtimeMonitor(data) {
         return `<div class="realtime-interval-chip ${selected ? "selected" : ""}">
             <button class="realtime-period-select" data-realtime-period="${period}" type="button">
                 <strong>${escapeHtml(period.replace("min", "分钟"))}</strong>
-                <small>每 ${interval || "—"} 分钟${nextRun ? ` · 下次 ${formatClock(nextRun)}` : ""}</small>
+                <small>单只每 ${interval || "—"} 分钟${nextRun ? ` · 下一任务 ${formatClock(nextRun)}` : ""}</small>
             </button>
             <span class="realtime-interval-summary" title="统计至少一条均线发生穿越的ETF数量，同一ETF只计一次">
                 <button class="summary-up ${selected && state.realtimeDirectionFilter === "up" ? "active" : ""}"
@@ -775,9 +779,10 @@ async function addRealtimeMonitor(symbol) {
             renderRealtimeMonitor(data.realtime);
             // 加入成功后结束本次搜索，避免已监控结果继续遮挡状态矩阵。
             clearRealtimeEtfSearch();
+            if (data.initialization_queued) scheduleRealtimePoll(1000);
         }
         if (state.currentView === "etfs") loadEtfs();
-        toast(`${symbol} 已加入实时监控池`);
+        toast(data.initialization_queued ? `${symbol} 已加入，正在初始化四周期数据` : `${symbol} 已加入实时监控池`);
     } catch (error) {
         toast(error.message, true);
     }
@@ -1011,8 +1016,12 @@ async function refreshMinuteChartModal(requestId = state.minuteChartRequestId) {
         renderProfessionalMinuteChart(points, period);
         document.getElementById("minuteChartSubtitle").textContent = `${klinePeriodLabel(period)}K线 · ${points.length}根本地缓存`;
         const refreshText = period === "D" ? "日线按需读取" : "每10秒自动读取最新缓存";
-        const warning = data.warning ? ` · ${data.warning}` : "";
-        document.getElementById("minuteChartSource").textContent = `${sourceDisplayName(data.source)} · ${points.length}根K线 · ${refreshText}${warning}`;
+        const warningMessages = [data.warning, data.ma_warning].filter(Boolean);
+        const warning = warningMessages.length ? ` · ${warningMessages.join(" · ")}` : "";
+        const adjustment = data.price_adjusted ? " · 已自动修复复权断层" : "";
+        const recalibrated = data.minute_cache_rebuilt ? " · 已重新校准分钟均线" : "";
+        const sourceSummary = `${sourceDisplayName(data.source)} · ${points.length}根K线 · ${refreshText}`;
+        document.getElementById("minuteChartSource").textContent = `${sourceSummary}${adjustment}${recalibrated}${warning}`;
     } catch (error) {
         if (requestId !== state.minuteChartRequestId) return;
         document.getElementById("minuteChartContainer").innerHTML = `<div class="chart-loading error">${escapeHtml(error.message)}</div>`;
@@ -1095,9 +1104,9 @@ function renderProfessionalMinuteChart(points, period = state.minuteChartPeriod)
         priceFormat: { type: "volume" }, priceScaleId: "volume", priceLineVisible: false, lastValueVisible: false,
     });
     candleSeries.setData(candles);
-    ma10Series.setData(period === "D" ? movingAverageSeries(candles, 10) : minuteMovingAverageSeries(candles, "ma10", 10));
-    ma30Series.setData(period === "D" ? movingAverageSeries(candles, 30) : minuteMovingAverageSeries(candles, "ma30", 30));
-    ma60Series.setData(period === "D" ? movingAverageSeries(candles, 60) : minuteMovingAverageSeries(candles, "ma60", 60));
+    ma10Series.setData(minuteMovingAverageSeries(candles, "ma10", 10));
+    ma30Series.setData(minuteMovingAverageSeries(candles, "ma30", 30));
+    ma60Series.setData(minuteMovingAverageSeries(candles, "ma60", 60));
     volumeSeries.setData(candles.map((item) => ({
         time: item.time, value: item.vol || 0, color: colorWithAlpha(item.close >= item.open ? red : green, 0.55),
     })));
@@ -1900,9 +1909,10 @@ async function openDailyChartModal(symbol, name) {
         updateDailyChartDetailMap(points);
         renderDailyChartSummary(points);
         const cacheState = data.has_ohlcv ? "OHLCV已缓存" : "OHLCV数据不完整";
-        document.getElementById("dailyChartSource").textContent = `${sourceDisplayName(data.source)} · ${points.length} 个交易日 · ${cacheState}`;
+        const adjustment = data.price_adjusted ? " · 已自动修复复权断层" : "";
+        document.getElementById("dailyChartSource").textContent = `${sourceDisplayName(data.source)} · ${points.length} 个交易日 · ${cacheState}${adjustment}`;
         const warning = document.getElementById("dailyChartWarning");
-        const warningMessage = data.warning || (data.has_ohlcv ? "" : "当前行情源未能提供完整的开高低收和成交量数据");
+        const warningMessage = data.warning || data.ma_warning || (data.has_ohlcv ? "" : "当前行情源未能提供完整的开高低收和成交量数据");
         warning.hidden = !warningMessage;
         warning.textContent = warningMessage;
         renderProfessionalDailyChart(points, symbol);
@@ -2089,6 +2099,9 @@ function normalizeDailyCandles(points) {
         low: numberOrNull(item.low),
         close: numberOrNull(item.close),
         vol: numberOrNull(item.vol),
+        ma10: numberOrNull(item.ma10),
+        ma30: numberOrNull(item.ma30),
+        ma60: numberOrNull(item.ma60),
     })).filter((item) => item.time && [item.open, item.high, item.low, item.close].every((value) => value !== null));
 }
 

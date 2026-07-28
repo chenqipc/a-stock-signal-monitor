@@ -13,6 +13,27 @@ from web_app.app import create_app
 from web_app.tasks import TaskManager
 
 
+def daily_history(periods):
+    """构造包含完整OHLCV字段的连续日线，用于验证均线预热和持久化。"""
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=periods)
+    close = pd.Series([10.0 + index * 0.01 for index in range(periods)])
+    return pd.DataFrame(
+        {
+            "trade_time": dates,
+            "open": close - 0.02,
+            "close": close,
+            "high": close + 0.05,
+            "low": close - 0.05,
+            "vol": [1000 + index for index in range(periods)],
+            "amount": [10000 + index * 10 for index in range(periods)],
+            "pre_close": close.shift(1).fillna(close.iloc[0]),
+            "pct_chg": [0.1] * periods,
+            "turnover_rate": [1.0] * periods,
+            "is_st": [0] * periods,
+        }
+    )
+
+
 class FakeTaskManager:
     """隔离Web接口测试，避免测试期间真正启动耗时扫描。"""
 
@@ -72,6 +93,7 @@ class FakeRealtimeMonitor:
     """模拟页面控制的实时线程，Web接口测试不访问外部行情。"""
 
     def __init__(self):
+        self.requested_symbols = []
         self.status = {
             "status": "stopped",
             "started_at": None,
@@ -93,6 +115,17 @@ class FakeRealtimeMonitor:
     def stop(self):
         self.status["status"] = "stopped"
         return self.get_status()
+
+    def request_scan(self, symbol):
+        if self.status["status"] != "running":
+            return False
+        self.requested_symbols.append(symbol)
+        return True
+
+    def request_initialization(self, symbol):
+        """Web接口新增ETF时，无论监控是否启动都模拟一次性补数入队。"""
+        self.requested_symbols.append(symbol)
+        return True
 
     def close(self):
         self.stop()
@@ -356,9 +389,9 @@ class WebAppTest(unittest.TestCase):
     def test_minute_kline_endpoint_returns_cached_ohlcv_for_realtime_chart(self):
         minute = sample_bars()
         minute["trade_time"] = pd.to_datetime(["2026-07-17 10:30", "2026-07-17 10:45"])
-        minute["ma10"] = [1.1, 1.2]
-        minute["ma30"] = [1.0, 1.1]
-        minute["ma60"] = [0.9, 1.0]
+        minute["ma10"] = [10.0, 10.1]
+        minute["ma30"] = [9.9, 10.0]
+        minute["ma60"] = [9.8, 9.9]
         self.database.save_klines("510300.SH", "15min", minute, "sina")
 
         response = self.client.get("/api/klines/510300.SH?period=15min&limit=2")
@@ -368,9 +401,39 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual("15min", payload["period"])
         self.assertEqual(2, len(payload["items"]))
         self.assertEqual("2026-07-17 10:45:00", payload["items"][-1]["trade_time"])
-        self.assertEqual(1.0, payload["items"][-1]["ma60"])
+        self.assertEqual(9.9, payload["items"][-1]["ma60"])
         self.assertTrue(payload["has_ohlcv"])
         self.assertTrue(payload["has_volume"])
+
+    def test_minute_kline_endpoint_rebuilds_suspicious_split_era_moving_averages(self):
+        minute = pd.DataFrame(
+            {
+                "trade_time": pd.date_range("2026-06-05 15:00", periods=62, freq="12h"),
+                "open": [0.70] * 62,
+                "high": [0.72] * 62,
+                "low": [0.68] * 62,
+                "close": [0.70] * 62,
+                "vol": [1000.0] * 62,
+                "amount": [700.0] * 62,
+                "pre_close": [0.70] * 62,
+                "pct_chg": [0.0] * 62,
+                "ma10": [0.70] * 62,
+                "ma30": [1.20 - index * 0.008 for index in range(62)],
+                "ma60": [1.95 - index * 0.02 for index in range(62)],
+            }
+        )
+        self.database.save_klines("512930.SH", "120min", minute, "sina")
+        refreshed = minute.drop(columns=["ma10", "ma30", "ma60"]).copy()
+        refreshed.attrs["source"] = "sina"
+
+        with patch("web_app.app.MarketDataService.get_minute_data", return_value=refreshed) as fetch:
+            response = self.client.get("/api/klines/512930.SH?period=120min&limit=100")
+
+        payload = response.get_json()
+        self.assertTrue(payload["minute_cache_rebuilt"])
+        self.assertIsNone(payload["items"][0]["ma60"])
+        self.assertAlmostEqual(0.70, payload["items"][-1]["ma60"], places=6)
+        self.assertTrue(fetch.call_args.kwargs["force_refresh"])
 
     def test_etf_list_and_independent_group_workflow(self):
         create_response = self.client.post("/api/instrument-groups", json={"asset_type": "etf", "name": "ETF自选"})
@@ -406,6 +469,28 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual("stopped", stopped.get_json()["manager"]["status"])
         self.assertEqual(200, removed.status_code)
         self.assertEqual([], removed.get_json()["realtime"]["items"])
+
+    def test_running_realtime_monitor_queues_new_etf_initialization(self):
+        self.realtime_monitor.start()
+
+        response = self.client.post(
+            "/api/realtime-monitor/watchlist",
+            json={"symbol": "159915.SZ", "asset_type": "etf"},
+        )
+
+        self.assertEqual(201, response.status_code)
+        self.assertTrue(response.get_json()["initialization_queued"])
+        self.assertEqual(["159915.SZ"], self.realtime_monitor.requested_symbols)
+
+    def test_stopped_realtime_monitor_queues_one_time_initialization(self):
+        response = self.client.post(
+            "/api/realtime-monitor/watchlist",
+            json={"symbol": "510300.SH", "asset_type": "etf"},
+        )
+
+        self.assertEqual(201, response.status_code)
+        self.assertTrue(response.get_json()["initialization_queued"])
+        self.assertEqual(["510300.SH"], self.realtime_monitor.requested_symbols)
 
     def test_etf_search_marks_realtime_monitored_items(self):
         self.database.add_realtime_monitor("510300.SH", "etf")
@@ -629,6 +714,8 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(2, len(payload["items"]))
         self.assertEqual(1000, payload["items"][0]["vol"])
         fetch.assert_called_once()
+        visible_start = pd.Timestamp.today().normalize() - pd.DateOffset(months=3)
+        self.assertLess(pd.Timestamp(fetch.call_args.args[1]), visible_start)
 
     def test_daily_chart_endpoint_pages_cached_history_before_cursor(self):
         bars = sample_bars()
@@ -642,6 +729,70 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(1, len(payload["items"]))
         self.assertEqual("2026-06-10 00:00:00", payload["items"][0]["trade_time"])
         self.assertTrue(all(item["trade_time"] < "2026-07-01" for item in payload["items"]))
+
+    def test_daily_chart_uses_warmup_history_and_persists_complete_ma_lines(self):
+        bars = daily_history(160)
+        self.database.save_klines(
+            "510300.SH",
+            "D",
+            bars,
+            "seed",
+            coverage_start=bars.iloc[0]["trade_time"],
+            coverage_end=bars.iloc[-1]["trade_time"],
+        )
+
+        response = self.client.get("/api/klines/510300.SH?period=D&months=2&limit=80")
+
+        payload = response.get_json()
+        persisted = self.database.load_klines("510300.SH", "D")
+        self.assertTrue(payload["ma_ready"])
+        self.assertIsNotNone(payload["items"][0]["ma60"])
+        self.assertIsNotNone(persisted.iloc[-1]["ma60"])
+        self.assertIsNone(payload["ma_warning"])
+
+    def test_daily_chart_repairs_split_gap_and_recalculates_moving_averages(self):
+        bars = daily_history(160)
+        split_position = 120
+        price_columns = ["open", "high", "low", "close", "pre_close"]
+        original_close_before_split = bars.iloc[split_position - 1]["close"]
+        expected_latest_ma60 = bars["close"].tail(60).mean()
+        bars["vol"] = bars["vol"].astype(float)
+        bars.loc[bars.index < split_position, price_columns] *= 3
+        bars.loc[bars.index < split_position, "vol"] /= 3
+        bars.loc[split_position, "pre_close"] = original_close_before_split
+        bars.loc[split_position, "pct_chg"] = (bars.loc[split_position, "close"] / original_close_before_split - 1) * 100
+        self.database.save_klines("515050.SH", "D", bars, "baostock")
+
+        first_response = self.client.get("/api/klines/515050.SH?period=D&months=12&limit=260")
+        second_response = self.client.get("/api/klines/515050.SH?period=D&months=12&limit=260")
+
+        first_payload = first_response.get_json()
+        persisted = self.database.load_klines("515050.SH", "D")
+        self.assertTrue(first_payload["price_adjusted"])
+        self.assertFalse(second_response.get_json()["price_adjusted"])
+        self.assertAlmostEqual(original_close_before_split, persisted.iloc[split_position - 1]["close"], places=6)
+        self.assertAlmostEqual(persisted.iloc[split_position - 1]["close"], persisted.iloc[split_position]["pre_close"], places=6)
+        self.assertAlmostEqual(expected_latest_ma60, persisted.iloc[-1]["ma60"], places=6)
+
+    def test_new_etf_history_reports_why_early_ma60_cannot_be_completed(self):
+        bars = daily_history(71)
+        self.database.save_klines(
+            "159915.SZ",
+            "D",
+            bars,
+            "seed",
+            coverage_start=pd.Timestamp.today().normalize() - pd.DateOffset(months=24),
+            coverage_end=bars.iloc[-1]["trade_time"],
+        )
+
+        response = self.client.get("/api/klines/159915.SZ?period=D&months=24&limit=500")
+
+        payload = response.get_json()
+        self.assertFalse(payload["ma_ready"])
+        self.assertIsNone(payload["items"][0]["ma60"])
+        self.assertIsNotNone(payload["items"][-1]["ma60"])
+        self.assertIn("MA60", payload["ma_warning"])
+        self.assertIsNotNone(payload["ma_complete_from"])
 
     def test_daily_chart_endpoint_rejects_invalid_history_cursor(self):
         response = self.client.get("/api/klines/000001.SZ?period=D&before=not-a-date")

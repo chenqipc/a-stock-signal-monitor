@@ -339,6 +339,44 @@ class MarketDataDatabase:
                 rows,
             )
 
+    def update_daily_kline_adjustments(self, symbol, data):
+        """覆盖修复后的日线价格并清空旧均线，保留原行情源和缓存覆盖信息。"""
+        self.update_kline_adjustments(symbol, "D", data)
+
+    def update_kline_adjustments(self, symbol, period, data):
+        """覆盖修复后的K线价格并清空旧均线，保留原行情源和缓存覆盖信息。"""
+        if data is None or data.empty:
+            return
+        required_columns = {"trade_time", "open", "high", "low", "close", "pre_close", "vol"}
+        if not required_columns.issubset(data.columns):
+            raise ValueError("复权数据缺少OHLC、前收盘价或成交量")
+        updated_at = self._utc_now()
+        rows = [
+            (
+                self._value_or_none(row["open"]),
+                self._value_or_none(row["high"]),
+                self._value_or_none(row["low"]),
+                self._value_or_none(row["close"]),
+                self._value_or_none(row["pre_close"]),
+                self._value_or_none(row["vol"]),
+                updated_at,
+                symbol,
+                period,
+                self._value_or_none(row["trade_time"]),
+            )
+            for _, row in data.iterrows()
+        ]
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                UPDATE kline
+                SET open = ?, high = ?, low = ?, close = ?, pre_close = ?, vol = ?,
+                    ma10 = NULL, ma30 = NULL, ma60 = NULL, updated_at = ?
+                WHERE symbol = ? AND period = ? AND trade_time = ?
+                """,
+                rows,
+            )
+
     @staticmethod
     def _coverage_value(value, fallback):
         return pd.Timestamp(fallback if value is None else value).isoformat(sep=" ")
