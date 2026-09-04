@@ -2150,6 +2150,32 @@ table > tbody > tr > td {
     margin-top: 2px;
 }
 
+.daily-preview-popover .preview-header-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 7px;
+}
+
+.preview-open-hint {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 4px;
+    color: var(--cyan);
+    font-size: 10px !important;
+    white-space: nowrap;
+}
+
+.preview-open-hint kbd {
+    padding: 1px 5px;
+    border: 1px solid color-mix(in srgb, var(--cyan) 28%, var(--border));
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--cyan) 8%, var(--panel-solid));
+    color: inherit;
+    font: inherit;
+    font-weight: 700;
+}
+
 .preview-ma-legend {
     display: flex;
     align-items: center;

@@ -279,6 +279,7 @@ function bindActions() {
     document.getElementById("startRealtimeMonitor")?.addEventListener("click", startRealtimeMonitor);
     document.getElementById("stopRealtimeMonitor")?.addEventListener("click", stopRealtimeMonitor);
     document.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && openVisiblePreviewChart(event)) return;
         if (event.key !== "Escape") return;
         const assignModal = document.getElementById("assignGroupModal");
         const groupModal = document.getElementById("groupModal");
@@ -855,6 +856,9 @@ async function showMinutePreview(card) {
     document.getElementById("minutePreviewName").textContent = name;
     document.getElementById("minutePreviewSymbol").textContent = symbol;
     document.getElementById("minutePreviewPeriod").textContent = period.replace("min", "分钟");
+    popover.dataset.symbol = symbol;
+    popover.dataset.name = name;
+    popover.dataset.period = period;
     document.getElementById("minutePreviewMeta").textContent = "正在读取分钟K线缓存…";
     document.getElementById("minutePreviewClose").textContent = "—";
     popover.hidden = false;
@@ -1783,6 +1787,8 @@ async function showDailyPreview(row, symbol, name) {
     state.dailyPreviewAnchor = row;
     document.getElementById("dailyPreviewName").textContent = name;
     document.getElementById("dailyPreviewSymbol").textContent = symbol;
+    popover.dataset.symbol = symbol;
+    popover.dataset.name = name;
     document.getElementById("dailyPreviewMeta").textContent = "正在读取日线缓存…";
     const changeElement = document.getElementById("dailyPreviewChange");
     changeElement.textContent = "—";
@@ -1810,6 +1816,23 @@ async function showDailyPreview(row, symbol, name) {
         destroyDailyPreviewChart();
         document.getElementById("dailyPreviewChart").innerHTML = `<div class="chart-loading error">${escapeHtml(error.message)}</div>`;
     }
+}
+
+function openVisiblePreviewChart(event) {
+    if (event.repeat || event.isComposing || event.target.closest("input, textarea, select, button, a, [contenteditable='true']")) return false;
+    const minutePopover = document.getElementById("minutePreviewPopover");
+    if (minutePopover && !minutePopover.hidden && minutePopover.dataset.symbol) {
+        event.preventDefault();
+        openMinuteChartModal(minutePopover.dataset.symbol, minutePopover.dataset.name, minutePopover.dataset.period);
+        return true;
+    }
+    const dailyPopover = document.getElementById("dailyPreviewPopover");
+    if (dailyPopover && !dailyPopover.hidden && dailyPopover.dataset.symbol) {
+        event.preventDefault();
+        openDailyChartModal(dailyPopover.dataset.symbol, dailyPopover.dataset.name);
+        return true;
+    }
+    return false;
 }
 
 function positionDailyPreview(x, y) {

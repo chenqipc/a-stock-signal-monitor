@@ -435,7 +435,13 @@
     </div>
 
     <aside class="daily-preview-popover" id="dailyPreviewPopover" hidden aria-live="polite">
-        <header><div><strong id="dailyPreviewName">日线预览</strong><span id="dailyPreviewSymbol"></span></div><small>近3个月</small></header>
+        <header>
+            <div><strong id="dailyPreviewName">日线预览</strong><span id="dailyPreviewSymbol"></span></div>
+            <div class="preview-header-actions">
+                <small>近3个月</small>
+                <span class="preview-open-hint"><kbd>Enter</kbd> 查看K线</span>
+            </div>
+        </header>
         <div class="daily-preview-chart" id="dailyPreviewChart" aria-label="近3个月蜡烛图预览"></div>
         <footer><span id="dailyPreviewMeta">正在读取本地缓存…</span><strong id="dailyPreviewChange">—</strong></footer>
     </aside>
@@ -443,7 +449,10 @@
     <aside class="daily-preview-popover minute-preview-popover" id="minutePreviewPopover" hidden aria-live="polite">
         <header>
             <div><strong id="minutePreviewName">实时K线预览</strong><span id="minutePreviewSymbol"></span></div>
-            <small id="minutePreviewPeriod">15分钟</small>
+            <div class="preview-header-actions">
+                <small id="minutePreviewPeriod">15分钟</small>
+                <span class="preview-open-hint"><kbd>Enter</kbd> 查看K线</span>
+            </div>
         </header>
         <div class="preview-ma-legend" aria-label="均线图例">
             <span><i class="legend-ma10"></i>MA10</span>
